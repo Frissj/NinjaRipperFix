@@ -182,77 +182,73 @@ class NFIX_OT_RemoveMatDuplicates(Operator):
 
     def execute(self, context):
         """
-        Delete meshes whose local-space geometry aligns (under affine least-squares) within tol,
-        providing debug output explaining each comparison and decision.
+        Deletes meshes that are duplicates in GEOMETRY AND LOCATION (World Space).
+        This will NOT delete identical objects (like two lamps) that have been
+        placed in different locations in the scene. A duplicate is only an object
+        that is stacked on top of an identical one.
         """
         import numpy as np
-        from mathutils import Vector, Matrix
-        from mathutils import kdtree  # only for potential KD use, but here mainly for count checks
+        from mathutils import Matrix
         depsgraph = context.evaluated_depsgraph_get()
         scene = context.scene
 
-        tol = 0.05
-        print(f"\n[NinjaFix DEBUG] Starting affine-overlap duplicate removal (tol = {tol:.4f})")
+        # A very small tolerance for world-space comparison.
+        # Two objects are duplicates if their vertices match within this distance.
+        tol = 0.001 
+        print(f"\n[NinjaFix DEBUG] Starting world-space duplicate removal (tol = {tol:.4f})")
 
-        # 1) Collect all mesh objects with their local-space points arrays
-        mesh_entries = []  # each: {'obj': ob, 'pts': np.ndarray shape (N,3)}
+        # 1) Collect all mesh objects with their WORLD-SPACE points arrays
+        mesh_entries = []  # each: {'obj': ob, 'pts': np.ndarray shape (N,3) in WORLD space}
         for ob in scene.objects:
             if ob.type != 'MESH':
-                print(f"[DEBUG] Skipping {ob.name}: not a mesh")
                 continue
+
+            # Use the existing helper to get final, world-space vertex coordinates
             pts_world = NFIX_AlignmentLogic.get_evaluated_world_points(ob, depsgraph)
+
             if pts_world.shape[0] == 0:
-                print(f"[DEBUG] Skipping {ob.name}: no vertices returned")
+                print(f"[DEBUG] Skipping '{ob.name}': no vertices.")
                 continue
-            # Transform world points into local space: apply inverse matrix_world
-            try:
-                inv = ob.matrix_world.inverted()
-            except Exception:
-                inv = Matrix.Identity(4)
-            # pts_world is Nx3; convert to homogeneous and back:
-            pts_h = np.hstack([pts_world, np.ones((pts_world.shape[0], 1), dtype=pts_world.dtype)])
-            inv_arr = np.array(inv)  # 4x4
-            pts_local = (pts_h @ inv_arr.T)[:, :3]
-            mesh_entries.append({'obj': ob, 'pts': pts_local})
-            print(f"[DEBUG] Collected '{ob.name}' with {pts_local.shape[0]} verts (local-space)")
+
+            mesh_entries.append({'obj': ob, 'pts': pts_world})
+            print(f"[DEBUG] Collected '{ob.name}' with {pts_world.shape[0]} world-space verts")
 
         n = len(mesh_entries)
         if n == 0:
             self.report({'WARNING'}, "No valid mesh objects found.")
             return {'CANCELLED'}
 
-        # 2) Build adjacency: for each pair i<j with same vertex count, test affine alignment error
+        # 2) Build adjacency: for each pair i<j with same vertex count, directly compare world points
         adj = {i: set() for i in range(n)}
         for i in range(n):
             ob_i = mesh_entries[i]['obj']
             pts_i = mesh_entries[i]['pts']
             cnt_i = pts_i.shape[0]
-            for j in range(i+1, n):
+
+            for j in range(i + 1, n):
                 ob_j = mesh_entries[j]['obj']
                 pts_j = mesh_entries[j]['pts']
+
+                # Must have same number of vertices to be a potential duplicate
                 if pts_j.shape[0] != cnt_i:
-                    # different topology/vertex count: skip
                     continue
-                # Compute best-fit affine from pts_i to pts_j
-                M = NFIX_AlignmentLogic.solve_alignment(pts_i, pts_j)  # Blender Matrix
-                # Apply M to pts_i:
-                # convert pts_i to homogeneous Nx4
-                pts_i_h = np.hstack([pts_i, np.ones((cnt_i, 1), dtype=pts_i.dtype)])
-                # extract M as numpy 4x4
-                M_arr = np.array(M)
-                aligned = (pts_i_h @ M_arr.T)[:, :3]
-                # measure max distance to pts_j
-                diffs = aligned - pts_j
+
+                # --- NEW SIMPLIFIED LOGIC ---
+                # No complex alignment. Just subtract the world positions and find the max error.
+                # If the max error is tiny, they are in the same location.
+                diffs = pts_i - pts_j
                 dists = np.linalg.norm(diffs, axis=1)
                 max_err = float(dists.max()) if dists.size else float('inf')
-                print(f"[DEBUG] Comparing '{ob_i.name}' → '{ob_j.name}': max affine error = {max_err:.6f}")
+
+                print(f"[DEBUG] Comparing '{ob_i.name}' vs '{ob_j.name}': max world-space dist = {max_err:.6f}")
+
                 if max_err < tol:
-                    # They align: consider duplicates
+                    # They are geometrically identical AND in the same location. This is a duplicate.
                     adj[i].add(j)
                     adj[j].add(i)
-                    print(f"[DEBUG] Marking overlap: '{ob_i.name}' and '{ob_j.name}' within tol")
+                    print(f"[DEBUG] Marking overlap: '{ob_i.name}' and '{ob_j.name}' are stacked duplicates.")
 
-        # 3) Find clusters (connected components in adjacency)
+        # 3) Find clusters (connected components)
         visited = set()
         clusters = []
         for i in range(n):
@@ -286,16 +282,14 @@ class NFIX_OT_RemoveMatDuplicates(Operator):
             return False
 
         for comp in clusters:
-            if len(comp) == 1:
-                idx = next(iter(comp))
-                ob = mesh_entries[idx]['obj']
-                print(f"[DEBUG] '{ob.name}' unique cluster (no overlaps), keeping")
-                continue
-            # multiple overlapping meshes: list names
+            if len(comp) <= 1:
+                continue  # Not a duplicate cluster
+
             entries = [mesh_entries[idx] for idx in comp]
             names = [e['obj'].name for e in entries]
             print(f"[DEBUG] Overlap cluster: {names}")
-            # Prefer unsuffixed Ninja
+
+            # Keeper selection logic
             keeper = None
             reason = ""
             for e in entries:
@@ -304,38 +298,41 @@ class NFIX_OT_RemoveMatDuplicates(Operator):
                     keeper = e['obj']
                     reason = "pure Ninja (no suffix)"
                     break
-            # Next prefer any with normal material
             if keeper is None:
                 for e in entries:
                     if has_normal(e['obj']):
                         keeper = e['obj']
                         reason = "has normal material"
                         break
-            # Fallback: first
             if keeper is None:
                 keeper = entries[0]['obj']
                 reason = "first fallback"
+
             print(f"[DEBUG] Keeper selected: '{keeper.name}' because {reason}")
-            # Mark others
             for e in entries:
                 ob = e['obj']
-                if ob is keeper:
-                    print(f"[DEBUG] Keeping '{ob.name}'")
-                else:
+                if ob is not keeper:
                     print(f"[DEBUG] Marking '{ob.name}' for deletion (duplicate of '{keeper.name}')")
                     to_delete.append(ob)
 
-        # 5) Delete marked objects, caching name before removal
+        # 5) Delete marked objects (applying all transforms before deletion)
         deleted = 0
         for ob in to_delete:
             name = ob.name
+            # Apply all transformations to the mesh before deleting
+            if ob.type == 'MESH':
+                mat = ob.matrix_world.copy()
+                ob.data.transform(mat)
+                ob.matrix_world = Matrix.Identity(4)
+
+            # Unlink from all collections before removing data
             for coll in list(ob.users_collection):
                 coll.objects.unlink(ob)
             bpy.data.objects.remove(ob, do_unlink=True)
             deleted += 1
             print(f"[NinjaFix] Deleted '{name}'")
 
-        self.report({'INFO'}, f"Removed {deleted} duplicate(s) based on affine overlap.")
+        self.report({'INFO'}, f"Removed {deleted} stacked duplicate(s).")
         return {'FINISHED'}
 
 # =================================================================================================
