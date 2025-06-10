@@ -34,3 +34,6 @@ Ninja Ripper is a tool that is able to rip meshes with shader transformations an
 
 Efficient. Accurate. Powerful.
 **NinjaFix Aligner**: Unlock your Blender productivity now!
+
+![image](https://github.com/user-attachments/assets/91086cf8-0778-4d77-96ee-ad6a7fb75307)
+
