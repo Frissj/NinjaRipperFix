@@ -33,6 +33,13 @@ Ninja Ripper is a tool that is able to rip meshes with shader transformations an
 ---
 
 Efficient. Accurate. Powerful.
+
+**How to Use**
+
+Import your remix capture and one ninja capture. Remember to click Get Texcoords From Local Space in the Ninja Ripper Blender importer addon. Select two meshes which are the same in game and that do not have symmetrical geometry. Press Set from Selection, then Generate and Apply Fix. If you want to import more ninja captures, after each import, press Add New Capture. Then once you have imported all needed captures, press Process All Captures. If you would like to import more captures anytime after this, remove the captures from the list, then Force Capture will show, import your new capture/s while also pressing add new capture after each, then Process Call Captures.
+
+The Ninja Ripper Blender addon can be found in C:\Program Files (x86)\Ninja Ripper 2.8\importers if you are using version 2.8. Adjust if needed. 
+
 **NinjaFix Aligner**: Unlock your Blender productivity now!
 
 ![image](https://github.com/user-attachments/assets/91086cf8-0778-4d77-96ee-ad6a7fb75307)
