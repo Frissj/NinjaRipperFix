@@ -11,7 +11,7 @@ bl_info = {
 import bpy
 import bmesh
 import sys, subprocess
-from bpy.props import PointerProperty, StringProperty
+from bpy.props import PointerProperty, StringProperty, BoolProperty, IntProperty
 from bpy.types import PropertyGroup, Operator, Panel
 import json
 from mathutils import Vector, Matrix, kdtree
@@ -83,6 +83,15 @@ def save_db(db):
             json.dump(db, f, indent=4)
     except Exception as e:
         print(f"Failed to save NinjaFix DB: {e}")
+
+# --- Forward declaration for PropertyGroup update function ---
+def toggle_auto_capture_timer(self, context):
+    """Starts or stops the auto-capture modal timer based on the checkbox state."""
+    if self.auto_capture:
+        # Call the operator to start the timer.
+        # It's safe to call this even if it's already running, though it's best if the user doesn't thrash the checkbox.
+        bpy.ops.nfix.auto_capture_timer('INVOKE_DEFAULT')
+    # If self.auto_capture is False, the running modal operator will detect this on its next tick and terminate itself.
 
 # =================================================================================================
 # Core Alignment and Data Logic (NEW AND UNIFIED)
@@ -420,6 +429,12 @@ class NFIX_OT_RemoveMatDuplicates(Operator):
 class NinjaFixSettings(PropertyGroup):
     source_obj: PointerProperty(type=bpy.types.Object)
     target_obj: PointerProperty(type=bpy.types.Object)
+    auto_capture: BoolProperty(
+        name="Auto Capture",
+        description="Automatically add a new capture when the number of mesh objects changes",
+        default=False,
+        update=toggle_auto_capture_timer
+    )
 
 class NFIX_OT_InstallNumpy(Operator):
     bl_idname = "nfix.install_numpy"
@@ -466,6 +481,51 @@ class NFIX_OT_SetObjects(Operator):
 # =================================================================================================
 # STAGE 2: CALCULATE AND APPLY INITIAL FIX
 # =================================================================================================
+class NFIX_OT_AutoCaptureTimer(Operator):
+    """Checks for mesh count changes and triggers auto-capture if enabled."""
+    bl_idname = "nfix.auto_capture_timer"
+    bl_label = "Auto Capture Timer"
+
+    _timer = None
+    last_mesh_count: IntProperty(default=-1)
+
+    def modal(self, context, event):
+        st = context.scene.ninjafix_settings
+        if not st.auto_capture:
+            self.cancel(context)
+            return {'CANCELLED'}
+
+        if event.type == 'TIMER':
+            current_mesh_count = len([o for o in context.scene.objects if o.type == 'MESH'])
+            if self.last_mesh_count == -1: self.last_mesh_count = current_mesh_count
+
+            if current_mesh_count != self.last_mesh_count:
+                ninjas = current_ninja_set(context.scene)
+                recorded = set().union(*(c['objects'] for c in CAPTURE_SETS))
+                if ninjas - recorded: # Only trigger if there are NEW ninja meshes
+                    bpy.ops.nfix.set_current_capture('EXEC_DEFAULT')
+                self.last_mesh_count = current_mesh_count
+                # Force UI redraw
+                for area in context.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        for region in area.regions:
+                            if region.type == 'UI':
+                                region.tag_redraw()
+        return {'PASS_THROUGH'}
+
+    def execute(self, context):
+        self.last_mesh_count = len([o for o in context.scene.objects if o.type == 'MESH'])
+        wm = context.window_manager
+        self._timer = wm.event_timer_add(1.0, window=context.window)
+        wm.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
+        if self._timer:
+            wm = context.window_manager
+            wm.event_timer_remove(self._timer)
+            self._timer = None
+
 class NFIX_OT_CalculateAndBatchFix(Operator):
     bl_idname = "nfix.calculate_and_batch_fix"
     bl_label  = "Generate & Apply Fix"
@@ -639,21 +699,14 @@ class NFIX_OT_ProcessAllCaptures(Operator):
                     # max per-vertex error
                     dists = np.linalg.norm(aligned - tgt_pts, axis=1)
                     if dists.max() < tol:
-                        # FIXED: Apply the complete transformation directly
-                        # instead of compounding with existing matrix
                         for nm in cap['objects']:
                             ob = context.scene.objects.get(nm)
                             if is_ninja(ob):
                                 if "ninjafix_prev_matrix" not in ob:
                                     ob["ninjafix_prev_matrix"] = mat_to_list(ob.matrix_world)
                                 
-                                # CORRECTED: Apply the full transformation matrix directly
-                                # instead of Mtest @ current matrix
-                                ob.matrix_world = Mtest
-                                
-                                # Optional: Apply non-uniform scale if needed
-                                # loc, rot, scale = Mtest.decompose()
-                                # ob.scale = scale
+                                # FIX: Apply transformation relative to current matrix
+                                ob.matrix_world = Mtest @ ob.matrix_world  # CORRECTED LINE
                                 
                         cap['reference_mesh'] = src.name
                         self.report({'INFO'},
@@ -661,7 +714,6 @@ class NFIX_OT_ProcessAllCaptures(Operator):
                         aligned_count += 1
                         matched = True
                         break
-
                 if matched:
                     break
 
@@ -730,11 +782,11 @@ class NFIX_OT_RemoveCapture(Operator):
         return {'FINISHED'}
 
 class VIEW3D_PT_NinjaFix_Aligner(Panel):
-    bl_label       = "NinjaFix Aligner"
-    bl_idname      = "VIEW3D_PT_nfix_aligner"
-    bl_space_type  = 'VIEW_3D'
+    bl_label = "NinjaFix Aligner"
+    bl_idname = "VIEW3D_PT_nfix_aligner"
+    bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category    = "NinjaFix"
+    bl_category = "NinjaFix"
 
     def draw(self, context):
         layout = self.layout
@@ -745,54 +797,41 @@ class VIEW3D_PT_NinjaFix_Aligner(Panel):
             layout.label(text="Restart Blender after installation.")
             return
 
-        # Stage 1: Select Meshes
         box = layout.box()
         box.label(text="Stage 1: Select Meshes", icon='OBJECT_DATA')
-        col = box.column()
-        col.operator('nfix.set_objects', icon='CHECKMARK')
-        if st.source_obj:
-            box.label(text=f"Ninja: {st.source_obj.name}", icon='MOD_MESHDEFORM')
-        if st.target_obj:
-            box.label(text=f"Remix: {st.target_obj.name}", icon='MESH_PLANE')
+        box.operator('nfix.set_objects', icon='CHECKMARK')
+        if st.source_obj: box.label(text=f"Ninja: {st.source_obj.name}", icon='MOD_MESHDEFORM')
+        if st.target_obj: box.label(text=f"Remix: {st.target_obj.name}", icon='MESH_PLANE')
 
-        # Stage 2: Initial Alignment
         box = layout.box()
         box.label(text="Stage 2: Initial Alignment", icon='PLAY')
         box.enabled = bool(st.source_obj and st.target_obj)
         box.operator('nfix.calculate_and_batch_fix', text="Generate & Apply Fix", icon='ROTATE')
 
-        # Stage 3: Manage Captures
         box = layout.box()
         box.label(text="Stage 3: Manage Captures", icon='BOOKMARKS')
-        # reload from scene prop if needed
+        box.prop(st, "auto_capture") # <-- NEW CHECKBOX
+        
         if not CAPTURE_SETS and "ninjafix_capture_sets" in context.scene:
-            try:
-                CAPTURE_SETS[:] = json.loads(context.scene["ninjafix_capture_sets"])
-            except:
-                pass
+            try: CAPTURE_SETS[:] = json.loads(context.scene["ninjafix_capture_sets"])
+            except: pass
 
         for cap in CAPTURE_SETS:
             row = box.row(align=True)
             ref = cap.get('reference_mesh', '') or '—'
-            row.label(
-                text=f"{cap['name']}: {ref}",
-                icon='CHECKMARK' if cap.get('reference_mesh') else 'QUESTION'
-            )
+            row.label(text=f"{cap['name']}: {ref}", icon='CHECKMARK' if cap.get('reference_mesh') else 'QUESTION')
             op = row.operator('nfix.remove_capture', text="", icon='X')
             op.capture_name = cap['name']
 
-        # If we have no captures yet, show Force Capture 1
         if not CAPTURE_SETS:
             box.operator('nfix.force_capture1', icon='BOOKMARKS', text="Force Capture 1")
         else:
             box.operator('nfix.set_current_capture', text="Add New Capture", icon='ADD')
 
-        # Stage 4: Process All & Cleanup
         box = layout.box()
-        box.label(text="Stage 4: Process All", icon='FILE_TICK')
+        box.label(text="Stage 4: Process All & Cleanup", icon='FILE_TICK')
         box.operator('nfix.process_all_captures', text="Process All Captures", icon='CHECKMARK')
         box.operator('nfix.undo_last_transform', text="Undo Last Transform", icon='LOOP_BACK')
-        # NEW button to delete duplicates using mat_ rule
         box.operator('nfix.remove_mat_duplicates', text="Remove mat_ Duplicates", icon='TRASH')
 
 # =================================================================================================
@@ -808,7 +847,8 @@ classes = (
     NFIX_OT_UndoLastTransform,
     NFIX_OT_SetCurrentCapture,
     NFIX_OT_RemoveCapture,
-    NFIX_OT_RemoveMatDuplicates,    # ← add this
+    NFIX_OT_RemoveMatDuplicates,
+    NFIX_OT_AutoCaptureTimer, # <-- Register new operator
     VIEW3D_PT_NinjaFix_Aligner,
 )
 
