@@ -393,35 +393,24 @@ class NFIX_OT_RemoveMatDuplicates(Operator):
                         to_delete.append(ob_e)
 
         # ---------------------------------------------------------------------
-        # 6) BATCH DELETE SAFELY
+        # 6) BATCH DELETE VIA OPERATOR
         # ---------------------------------------------------------------------
-        deleted = 0
-        print(f"\n[DEBUG] Deleting {len(to_delete)} objects:")
-        # First unlink all to avoid modifying scene.objects mid-loop
+        # Deselect everything first
+        bpy.ops.object.select_all(action='DESELECT')
+
+        # Select all duplicates
         for ob in to_delete:
-            for coll in list(ob.users_collection):
-                try:
-                    coll.objects.unlink(ob)
-                except Exception as e:
-                    print(f"[DEBUG] Warning: failed to unlink '{ob.name}' from collection: {e}")
-        # Then remove
-        for ob in to_delete:
-            name = ob.name
-            print(f"[DEBUG] Deleting '{name}'")
-            if ob.type == 'MESH':
-                mat = ob.matrix_world.copy()
-                try:
-                    ob.data.transform(mat)
-                except Exception as e:
-                    print(f"[DEBUG] Warning: bake failed for '{name}': {e}")
-                ob.matrix_world = Matrix.Identity(4)
-            try:
-                bpy.data.objects.remove(ob, do_unlink=True)
-                deleted += 1
-                print(f"[NinjaFix] Deleted '{name}'")
-            except Exception as e:
-                print(f"[DEBUG] Warning: removal failed for '{name}': {e}")
-        self.report({'INFO'}, f"Removed {deleted} duplicates.")
+            ob.select_set(True)
+
+        # Set one as the active object (required by the operator)
+        if to_delete:
+            context.view_layer.objects.active = to_delete[0]
+
+        # Delete all selected at once
+        bpy.ops.object.delete()
+
+        # Report how many were removed
+        self.report({'INFO'}, f"Removed {len(to_delete)} duplicates.")
         print("================ NinjaFix DEBUG END ================\n")
         return {'FINISHED'}
 
