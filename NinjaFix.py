@@ -1,31 +1,30 @@
-#
-# NinjaFix Aligner – FULL ADD-ON v3.1.6
-# Date: 2025-06-07
-#
-# Aligns distorted Ninja Ripper meshes to a correct RTX Remix mesh
-# using a guided, step-by-step vertex confirmation system.
-# Supports full affine transforms (non-uniform scale, shear) via least squares.
-#
-
 bl_info = {
-    "name":        "NinjaFix Aligner",
-    "author":      "Gemini/Google & User",
-    "version":     (3, 1, 6),
-    "blender":     (3, 0, 0),
-    "category":    "Object",
-    "description": "Fixes Ninja Ripper meshes using a Remix reference and a guided vertex workflow.",
-    "warning":     "Requires one-time internet to auto-install NumPy.",
+    "name": "NinjaFix Aligner (multi-capture)",
+    "author": "Gemini/Google & User",
+    "version": (5, 0, 0),
+    "blender": (3, 0, 0),
+    "category": "Object",
+    "description": "Align any number of Ninja Ripper captures with a Remix reference.",
+    "warning": "Requires NumPy. First run auto-installer in the panel if necessary.",
 }
 
 import bpy
 import bmesh
-import subprocess
-import sys
-from mathutils import Vector, Matrix
-from bpy.props   import PointerProperty, FloatVectorProperty, BoolProperty, StringProperty
-from bpy.types   import PropertyGroup, Operator, Panel
+import sys, subprocess
+from bpy.props import PointerProperty, StringProperty
+from bpy.types import PropertyGroup, Operator, Panel
+import json
+from mathutils import Vector, Matrix, kdtree
+import hashlib
+import os
+import numpy as np
 
-# NumPy dependency
+# --- Globals ---
+CAPTURE_SETS = []
+INITIAL_ALIGN_MATRIX = None
+GOLDEN_TARGETS = {} # NEW: To store the 'snapshot' of target points
+
+# --- Dependency Check ---
 try:
     import numpy as np
     NUMPY_INSTALLED = True
@@ -33,265 +32,625 @@ except ImportError:
     np = None
     NUMPY_INSTALLED = False
 
-# --- Property Group ---
+# --- Globals ---
+CAPTURE_SETS = []
+INITIAL_ALIGN_MATRIX = None
+
+# =================================================================================================
+# Utility Helpers
+# =================================================================================================
+def is_ninja(ob):
+    """
+    True for every mesh imported by Ninja Ripper. Handles ".001" suffixes.
+    """
+    return ob and ob.type == 'MESH' and ob.name.startswith("mesh_")
+
+def is_remix(ob):
+    """
+    True for Remix reference parts (meshes not from Ninja Ripper with a dot in the name).
+    """
+    return ob and ob.type == 'MESH' and ('.' in ob.name) and not ob.name.startswith("mesh_")
+
+def current_ninja_set(scene):
+    return {ob.name for ob in scene.objects if is_ninja(ob)}
+
+def mat_to_list(M):
+    return [c for r in M for c in r]
+
+def get_db_path():
+    """Return path to the per-.blend NinjaFix JSON DB (alongside the .blend)."""
+    blend_path = bpy.data.filepath
+    if not blend_path:
+        return None
+    return os.path.join(os.path.dirname(blend_path), ".ninjafix_db.json")
+
+def load_db():
+    path = get_db_path()
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_db(db):
+    path = get_db_path()
+    if not path:
+        return
+    try:
+        with open(path, 'w') as f:
+            json.dump(db, f, indent=4)
+    except Exception as e:
+        print(f"Failed to save NinjaFix DB: {e}")
+
+# =================================================================================================
+# Core Alignment and Data Logic (NEW AND UNIFIED)
+# =================================================================================================
+class NFIX_AlignmentLogic:
+    """A collection of static methods for consistent alignment logic."""
+
+    @staticmethod
+    def get_evaluated_world_points(obj, depsgraph):
+        """
+        Safely gets the world-space vertex coordinates of an object's final,
+        evaluated geometry. Returns an empty array if anything fails.
+        """
+        if obj is None or obj.type != 'MESH':
+            return np.array([])
+        
+        try:
+            eval_obj = obj.evaluated_get(depsgraph)
+            # Using .to_mesh() is sufficient and safer inside a try-finally block.
+            temp_mesh = eval_obj.to_mesh()
+            
+            if not temp_mesh.vertices:
+                return np.array([])
+
+            # Get points and transform to world space
+            size = len(temp_mesh.vertices)
+            points = np.empty(size * 3, dtype=np.float32)
+            temp_mesh.vertices.foreach_get("co", points)
+            points.shape = (size, 3)
+            
+            # Apply world matrix transformation
+            matrix = np.array(eval_obj.matrix_world)
+            points_h = np.hstack([points, np.ones((size, 1))])
+            world_points = (points_h @ matrix.T)[:, :3]
+
+            return world_points
+
+        finally:
+            if 'temp_mesh' in locals() and temp_mesh:
+                # This ensures the temp mesh is always freed.
+                eval_obj.to_mesh_clear()
+
+    @staticmethod
+    def solve_alignment(source_points, target_points):
+        """
+        Calculates the best-fit AFFINE transform (including non-uniform scale)
+        to align source_points to target_points using the least-squares method.
+        Returns a 4x4 Blender Matrix.
+        """
+        if source_points.shape[0] == 0 or source_points.shape[0] != target_points.shape[0]:
+            return Matrix.Identity(4)
+
+        n = source_points.shape[0]
+
+        # 1. Pad the source points to homogeneous coordinates
+        S_h = np.hstack([source_points, np.ones((n, 1))])
+
+        # 2. Solve the least squares problem T = S_h @ M_T for the 4x3 transform matrix
+        M_T, _, _, _ = np.linalg.lstsq(S_h, target_points, rcond=None)
+
+        # 3. Create the 4x4 Blender matrix
+        M = Matrix.Identity(4)
+    
+        # 4. Transpose and assign the result to the Blender matrix using loops
+        M_T_transposed = M_T.T
+        for r in range(3):
+            for c in range(4):
+                M[r][c] = M_T_transposed[r, c]
+
+        return M
+
+    @staticmethod
+    def get_texture_hash(obj):
+        if not obj: return ""
+        paths = set()
+        for slot in obj.material_slots:
+            mat = slot.material
+            if not mat or not mat.use_nodes: continue
+            for node in mat.node_tree.nodes:
+                if node.type == 'TEX_IMAGE' and getattr(node, 'image', None):
+                    paths.add(bpy.path.abspath(node.image.filepath))
+        m = hashlib.md5()
+        for p in sorted(list(paths)):
+            try:
+                with open(p, 'rb') as f: m.update(f.read())
+            except Exception: m.update(p.encode('utf-8'))
+        return m.hexdigest()
+
+class NFIX_OT_RemoveMatDuplicates(Operator):
+    bl_idname = "nfix.remove_mat_duplicates"
+    bl_label  = "Remove mat_ Duplicates"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return NUMPY_INSTALLED
+
+    def execute(self, context):
+        """
+        Delete meshes whose local-space geometry aligns (under affine least-squares) within tol,
+        providing debug output explaining each comparison and decision.
+        """
+        import numpy as np
+        from mathutils import Vector, Matrix
+        from mathutils import kdtree  # only for potential KD use, but here mainly for count checks
+        depsgraph = context.evaluated_depsgraph_get()
+        scene = context.scene
+
+        tol = 0.05
+        print(f"\n[NinjaFix DEBUG] Starting affine-overlap duplicate removal (tol = {tol:.4f})")
+
+        # 1) Collect all mesh objects with their local-space points arrays
+        mesh_entries = []  # each: {'obj': ob, 'pts': np.ndarray shape (N,3)}
+        for ob in scene.objects:
+            if ob.type != 'MESH':
+                print(f"[DEBUG] Skipping {ob.name}: not a mesh")
+                continue
+            pts_world = NFIX_AlignmentLogic.get_evaluated_world_points(ob, depsgraph)
+            if pts_world.shape[0] == 0:
+                print(f"[DEBUG] Skipping {ob.name}: no vertices returned")
+                continue
+            # Transform world points into local space: apply inverse matrix_world
+            try:
+                inv = ob.matrix_world.inverted()
+            except Exception:
+                inv = Matrix.Identity(4)
+            # pts_world is Nx3; convert to homogeneous and back:
+            pts_h = np.hstack([pts_world, np.ones((pts_world.shape[0], 1), dtype=pts_world.dtype)])
+            inv_arr = np.array(inv)  # 4x4
+            pts_local = (pts_h @ inv_arr.T)[:, :3]
+            mesh_entries.append({'obj': ob, 'pts': pts_local})
+            print(f"[DEBUG] Collected '{ob.name}' with {pts_local.shape[0]} verts (local-space)")
+
+        n = len(mesh_entries)
+        if n == 0:
+            self.report({'WARNING'}, "No valid mesh objects found.")
+            return {'CANCELLED'}
+
+        # 2) Build adjacency: for each pair i<j with same vertex count, test affine alignment error
+        adj = {i: set() for i in range(n)}
+        for i in range(n):
+            ob_i = mesh_entries[i]['obj']
+            pts_i = mesh_entries[i]['pts']
+            cnt_i = pts_i.shape[0]
+            for j in range(i+1, n):
+                ob_j = mesh_entries[j]['obj']
+                pts_j = mesh_entries[j]['pts']
+                if pts_j.shape[0] != cnt_i:
+                    # different topology/vertex count: skip
+                    continue
+                # Compute best-fit affine from pts_i to pts_j
+                M = NFIX_AlignmentLogic.solve_alignment(pts_i, pts_j)  # Blender Matrix
+                # Apply M to pts_i:
+                # convert pts_i to homogeneous Nx4
+                pts_i_h = np.hstack([pts_i, np.ones((cnt_i, 1), dtype=pts_i.dtype)])
+                # extract M as numpy 4x4
+                M_arr = np.array(M)
+                aligned = (pts_i_h @ M_arr.T)[:, :3]
+                # measure max distance to pts_j
+                diffs = aligned - pts_j
+                dists = np.linalg.norm(diffs, axis=1)
+                max_err = float(dists.max()) if dists.size else float('inf')
+                print(f"[DEBUG] Comparing '{ob_i.name}' → '{ob_j.name}': max affine error = {max_err:.6f}")
+                if max_err < tol:
+                    # They align: consider duplicates
+                    adj[i].add(j)
+                    adj[j].add(i)
+                    print(f"[DEBUG] Marking overlap: '{ob_i.name}' and '{ob_j.name}' within tol")
+
+        # 3) Find clusters (connected components in adjacency)
+        visited = set()
+        clusters = []
+        for i in range(n):
+            if i in visited:
+                continue
+            stack = [i]
+            comp = set()
+            while stack:
+                u = stack.pop()
+                if u in comp:
+                    continue
+                comp.add(u)
+                visited.add(u)
+                for v in adj[u]:
+                    if v not in comp:
+                        stack.append(v)
+            clusters.append(comp)
+
+        # 4) For each cluster, choose keeper and mark others
+        to_delete = []
+        import re
+        hash_pat = re.compile(r"^mat_[A-F0-9]{6,}$", re.I)
+
+        def has_normal(ob):
+            if not ob.material_slots:
+                return True
+            for slot in ob.material_slots:
+                mat = slot.material
+                if mat is None or not hash_pat.fullmatch(mat.name):
+                    return True
+            return False
+
+        for comp in clusters:
+            if len(comp) == 1:
+                idx = next(iter(comp))
+                ob = mesh_entries[idx]['obj']
+                print(f"[DEBUG] '{ob.name}' unique cluster (no overlaps), keeping")
+                continue
+            # multiple overlapping meshes: list names
+            entries = [mesh_entries[idx] for idx in comp]
+            names = [e['obj'].name for e in entries]
+            print(f"[DEBUG] Overlap cluster: {names}")
+            # Prefer unsuffixed Ninja
+            keeper = None
+            reason = ""
+            for e in entries:
+                name = e['obj'].name
+                if name.startswith("mesh_") and "." not in name:
+                    keeper = e['obj']
+                    reason = "pure Ninja (no suffix)"
+                    break
+            # Next prefer any with normal material
+            if keeper is None:
+                for e in entries:
+                    if has_normal(e['obj']):
+                        keeper = e['obj']
+                        reason = "has normal material"
+                        break
+            # Fallback: first
+            if keeper is None:
+                keeper = entries[0]['obj']
+                reason = "first fallback"
+            print(f"[DEBUG] Keeper selected: '{keeper.name}' because {reason}")
+            # Mark others
+            for e in entries:
+                ob = e['obj']
+                if ob is keeper:
+                    print(f"[DEBUG] Keeping '{ob.name}'")
+                else:
+                    print(f"[DEBUG] Marking '{ob.name}' for deletion (duplicate of '{keeper.name}')")
+                    to_delete.append(ob)
+
+        # 5) Delete marked objects, caching name before removal
+        deleted = 0
+        for ob in to_delete:
+            name = ob.name
+            for coll in list(ob.users_collection):
+                coll.objects.unlink(ob)
+            bpy.data.objects.remove(ob, do_unlink=True)
+            deleted += 1
+            print(f"[NinjaFix] Deleted '{name}'")
+
+        self.report({'INFO'}, f"Removed {deleted} duplicate(s) based on affine overlap.")
+        return {'FINISHED'}
+
+# =================================================================================================
+# Property Groups & UI Setup
+# =================================================================================================
 class NinjaFixSettings(PropertyGroup):
-    source_obj: PointerProperty(type=bpy.types.Object, name="Source (Ninja)")
-    target_obj: PointerProperty(type=bpy.types.Object, name="Reference (Remix)")
-
-    remix_v1: FloatVectorProperty(name="Remix Vertex 1"); remix_v1_picked: BoolProperty(default=False)
-    ninja_v1: FloatVectorProperty(name="Ninja Vertex 1"); ninja_v1_picked: BoolProperty(default=False)
-    remix_v2: FloatVectorProperty(name="Remix Vertex 2"); remix_v2_picked: BoolProperty(default=False)
-    ninja_v2: FloatVectorProperty(name="Ninja Vertex 2"); ninja_v2_picked: BoolProperty(default=False)
-    remix_v3: FloatVectorProperty(name="Remix Vertex 3"); remix_v3_picked: BoolProperty(default=False)
-    ninja_v3: FloatVectorProperty(name="Ninja Vertex 3"); ninja_v3_picked: BoolProperty(default=False)
-    remix_v4: FloatVectorProperty(name="Remix Vertex 4"); remix_v4_picked: BoolProperty(default=False)
-    ninja_v4: FloatVectorProperty(name="Ninja Vertex 4"); ninja_v4_picked: BoolProperty(default=False)
-
-    stored_transform: FloatVectorProperty(name="Stored Transformation Matrix", size=16, default=[1]*16)
-    is_transform_stored: BoolProperty(default=False)
-
-    def are_all_points_picked(self) -> bool:
-        return all(getattr(self, f"{p}_picked") for p in (
-            "remix_v1","ninja_v1",
-            "remix_v2","ninja_v2",
-            "remix_v3","ninja_v3",
-            "remix_v4","ninja_v4"
-        ))
-
-# --- Operators ---
+    source_obj: PointerProperty(type=bpy.types.Object)
+    target_obj: PointerProperty(type=bpy.types.Object)
 
 class NFIX_OT_InstallNumpy(Operator):
     bl_idname = "nfix.install_numpy"
-    bl_label  = "Install NumPy"
+    bl_label = "Install NumPy"
     def execute(self, context):
-        self.report({'INFO'}, "Installing NumPy… please wait.")
-        python_exe = sys.executable
         try:
-            subprocess.check_call([python_exe, "-m", "pip", "install", "--upgrade", "pip"],
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.check_call([python_exe, "-m", "pip", "install", "numpy"],
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.report({'INFO'}, "NumPy installed successfully! Restart Blender.")
-        except Exception:
-            self.report({'ERROR'}, "NumPy installation failed; check console.")
+            py = sys.executable
+            subprocess.check_call([py, "-m", "pip", "install", "--upgrade", "pip"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.check_call([py, "-m", "pip", "install", "numpy"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.report({'INFO'}, "NumPy installed! Please restart Blender to enable the addon.")
+        except Exception as e:
+            self.report({'ERROR'}, f"NumPy installation failed: {e}")
         return {'FINISHED'}
 
 class NFIX_OT_SetObjects(Operator):
     bl_idname = "nfix.set_objects"
-    bl_label  = "Set Ninja & Remix Objects"
+    bl_label = "Set from Selection"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
+        # This poll correctly checks if two objects are selected
         return len(context.selected_objects) == 2 and context.mode == 'OBJECT'
 
     def execute(self, context):
         src = tgt = None
-
-        # Prefix‐based selection
+        # This logic now correctly reads from the selection
         for ob in context.selected_objects:
-            if ob.name.startswith("mesh_"):
+            if is_ninja(ob):
                 src = ob
-            elif ob.name.startswith("mesh."):
+            elif is_remix(ob):
                 tgt = ob
-
-        # Fallback
-        if not src or not tgt:
-            for ob in context.selected_objects:
-                if not src and "_" in ob.name:
-                    src = ob
-                if not tgt and "." in ob.name:
-                    tgt = ob
-
+        
         if not (src and tgt):
-            self.report({'ERROR'},
-                "Name one mesh as ‘mesh_xxx’ (Ninja) and one as ‘mesh.xxx’ (Remix).")
+            self.report({'ERROR'}, "Selection must include one Ninja mesh and one Remix mesh.")
             return {'CANCELLED'}
-
+            
         st = context.scene.ninjafix_settings
         st.source_obj = src
         st.target_obj = tgt
-
-        # Keep both selected; make Remix active and enter Edit Mode
-        context.view_layer.objects.active = tgt
-        bpy.ops.object.mode_set(mode='EDIT')
-
-        # <<< FIX: immediately deselect all vertices >>> 
-        bpy.ops.mesh.select_all(action='DESELECT')
-
-        bpy.ops.nfix.clear_all_points()
-        self.report({'INFO'},
-            f"Source = '{src.name}', Target = '{tgt.name}'. Ready to pick vertices.")
+        self.report({'INFO'}, f"Source: '{src.name}', Target: '{tgt.name}'.")
         return {'FINISHED'}
-
-class NFIX_OT_ConfirmVertex(Operator):
-    bl_idname = "nfix.confirm_vertex"
-    bl_label  = "Pick Vertex"
-    target_prop_name: StringProperty()
-
-    @classmethod
-    def poll(cls, context):
-        return context.mode.startswith("EDIT") and context.edit_object is not None
-
-    def execute(self, context):
-        st = context.scene.ninjafix_settings
-        active = context.edit_object
-        is_remix = self.target_prop_name.startswith("remix")
-        expected = st.target_obj if is_remix else st.source_obj
-
-        if active != expected:
-            self.report({'ERROR'}, f"Switch Edit Mode to '{expected.name}' first.")
-            return {'CANCELLED'}
-
-        bm = bmesh.from_edit_mesh(active.data)
-        verts = [v for v in bm.verts if v.select]
-        if len(verts) != 1:
-            self.report({'ERROR'}, "Select exactly ONE vertex, then click the button.")
-            return {'CANCELLED'}
-
-        world_co = active.matrix_world @ verts[0].co
-        setattr(st, self.target_prop_name, world_co)
-        setattr(st, self.target_prop_name + "_picked", True)
-        self.report({'INFO'}, f"{self.target_prop_name.replace('_',' ').title()} recorded.")
-        return {'FINISHED'}
-
-class NFIX_OT_ClearSinglePoint(Operator):
-    bl_idname = "nfix.clear_single_point"
-    bl_label  = "Clear Point"
-    bl_options = {'REGISTER', 'UNDO'}
-    target_prop_name: StringProperty()
-
-    def execute(self, context):
-        st = context.scene.ninjafix_settings
-        setattr(st, self.target_prop_name, (0,0,0))
-        setattr(st, self.target_prop_name + "_picked", False)
-        st.is_transform_stored = False
-        return {'FINISHED'}
-
-class NFIX_OT_ClearAllPoints(Operator):
-    bl_idname = "nfix.clear_all_points"
-    bl_label  = "Clear All Points"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        st = context.scene.ninjafix_settings
-        for i in range(1,5):
-            for prefix in ("remix","ninja"):
-                setattr(st, f"{prefix}_v{i}", (0,0,0))
-                setattr(st, f"{prefix}_v{i}_picked", False)
-        st.is_transform_stored = False
-        self.report({'INFO'}, "All picks cleared.")
-        return {'FINISHED'}
-
+        
+# =================================================================================================
+# STAGE 2: CALCULATE AND APPLY INITIAL FIX
+# =================================================================================================
 class NFIX_OT_CalculateAndBatchFix(Operator):
     bl_idname = "nfix.calculate_and_batch_fix"
-    bl_label  = "Calculate & Apply to All"
+    bl_label  = "Generate & Apply Fix"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        return NUMPY_INSTALLED and context.scene.ninjafix_settings.are_all_points_picked()
+        st = context.scene.ninjafix_settings
+        return NUMPY_INSTALLED and st.source_obj and st.target_obj
 
     def execute(self, context):
-        # exit Edit Mode
-        if context.mode.startswith("EDIT"):
-            bpy.ops.object.mode_set(mode='OBJECT')
+        global INITIAL_ALIGN_MATRIX, GOLDEN_TARGETS
 
         st = context.scene.ninjafix_settings
+        depsgraph = context.evaluated_depsgraph_get()
 
-        # Source and target points
-        src = np.array([st.ninja_v1, st.ninja_v2, st.ninja_v3, st.ninja_v4])
-        tgt = np.array([st.remix_v1, st.remix_v2, st.remix_v3, st.remix_v4])
+        src_pts = NFIX_AlignmentLogic.get_evaluated_world_points(st.source_obj, depsgraph)
+        tgt_pts = NFIX_AlignmentLogic.get_evaluated_world_points(st.target_obj, depsgraph)
 
-        # Augment with ones for affine solve
-        ones = np.ones((4,1))
-        X_aug = np.hstack((src, ones))  # shape (4,4)
+        if src_pts.shape[0] == 0 or src_pts.shape[0] != tgt_pts.shape[0]:
+            self.report({'ERROR'}, "Meshes must be valid and have identical vertex counts.")
+            return {'CANCELLED'}
 
-        # Least squares solve X_aug @ A = tgt  →  A is 4×3
-        A, *_ = np.linalg.lstsq(X_aug, tgt, rcond=None)
+        # --- compute initial alignment matrix ---
+        M0 = NFIX_AlignmentLogic.solve_alignment(src_pts, tgt_pts)
+        INITIAL_ALIGN_MATRIX = M0.copy()
 
-        # Build 4×4 matrix
-        M = Matrix.Identity(4)
-        for i in range(3):       # target coord index
-            for j in range(4):   # source coord + bias
-                M[i][j] = A[j, i]
+        # --- extract non-uniform scale and save FULL matrix + scale to DB ---
+        loc, rot, scale = M0.decompose()
+        db = load_db()
+        blend_file = bpy.data.filepath
+        db[blend_file] = {
+            "scale": [scale.x, scale.y, scale.z],
+            "matrix": mat_to_list(M0)
+        }
+        save_db(db)
+        self.report({'INFO'}, f"Saved full alignment matrix and scale to DB for {blend_file}")
 
-        # Apply to primary
-        st.source_obj.matrix_world = M
-        st.stored_transform = [v for row in M for v in row]
-        st.is_transform_stored = True
-        self.report({'INFO'}, "Primary mesh aligned with full affine transform.")
+        # --- apply M0 to your first capture ---
+        first_set = current_ninja_set(context.scene)
+        for name in first_set:
+            ob = context.scene.objects.get(name)
+            if is_ninja(ob):
+                ob["ninjafix_prev_matrix"] = mat_to_list(ob.matrix_world)
+                ob.matrix_world = M0 @ ob.matrix_world
 
-        # Batch apply
-        original = st.source_obj.name
-        count = 0
-        for ob in context.scene.objects:
-            if ob.type == 'MESH' and '_' in ob.name and ob.name != original:
-                ob.matrix_world = M
-                count += 1
-        self.report({'INFO'}, f"Applied transform to {count} other Ninja meshes.")
+        # --- cache golden targets (unchanged) ---
+        self.report({'INFO'}, "Caching golden target data...")
+        GOLDEN_TARGETS.clear()
+        depsgraph.update()
+
+        remix_objs = [o for o in context.scene.objects if is_remix(o)]
+        cap1_objs = [context.scene.objects.get(n) for n in first_set if context.scene.objects.get(n)]
+        for t_obj in remix_objs + cap1_objs:
+            if not t_obj or t_obj.type != 'MESH':
+                continue
+            t_hash = NFIX_AlignmentLogic.get_texture_hash(t_obj)
+            t_pts = NFIX_AlignmentLogic.get_evaluated_world_points(t_obj, depsgraph)
+            if t_pts.shape[0] > 0:
+                GOLDEN_TARGETS.setdefault(t_hash, []).append(t_pts)
+
+        if not any(c['name'] == "Capture 1" for c in CAPTURE_SETS):
+            CAPTURE_SETS.insert(0, {
+                'name': "Capture 1",
+                'objects': first_set,
+                'reference_mesh': st.source_obj.name
+            })
+            context.scene["ninjafix_capture_sets"] = json.dumps([
+                {'name': c['name'], 'objects': list(c['objects']), 'reference_mesh': c.get('reference_mesh','')}
+                for c in CAPTURE_SETS
+            ])
+
+        self.report({'INFO'}, "Initial alignment applied and target snapshot created.")
         return {'FINISHED'}
 
-# --- UI Panel ---
-class NFIX_OT_DeleteDuplicateNinjas(Operator):
-    bl_idname = "nfix.delete_duplicate_ninjas"
-    bl_label  = "Delete Duplicate Ninjas"
-    bl_description = "Remove any Ninja mesh whose vertices approximately match a Remix mesh"
+class NFIX_OT_ForceCapture1(Operator):
+    bl_idname = "nfix.force_capture1"
+    bl_label = "Force Capture 1"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        tol = 0.01
+        global CAPTURE_SETS, GOLDEN_TARGETS
         scene = context.scene
-        deleted = 0
 
-        # Gather world-space coords for each Remix mesh
-        remix_sets = []
-        for ob in scene.objects:
-            if ob.type == 'MESH' and '.' in ob.name and '_' not in ob.name:
-                coords = [ob.matrix_world @ v.co for v in ob.data.vertices]
-                remix_sets.append(coords)
+        # Record all current Ninja meshes as Capture 1
+        first_set = current_ninja_set(scene)
+        CAPTURE_SETS.insert(0, {
+            'name': "Capture 1",
+            'objects': first_set,
+            'reference_mesh': ''
+        })
+        scene["ninjafix_capture_sets"] = json.dumps([
+            {'name': c['name'], 'objects': list(c['objects']), 'reference_mesh': c.get('reference_mesh','')}
+            for c in CAPTURE_SETS
+        ])
 
-        # For each Ninja mesh, compare against each Remix set
-        for ob in list(scene.objects):
-            if ob.type == 'MESH' and '_' in ob.name and '.' not in ob.name:
-                ninja_coords = [ob.matrix_world @ v.co for v in ob.data.vertices]
-                for rv in remix_sets:
-                    if len(rv) == len(ninja_coords):
-                        # compute RMSE
-                        sq_diffs = [(ninja_coords[i] - rv[i]).length_squared for i in range(len(rv))]
-                        rmse = (sum(sq_diffs) / len(sq_diffs))**0.5
-                        if rmse < tol:
-                            bpy.data.objects.remove(ob, do_unlink=True)
-                            deleted += 1
-                            break
+        # Build in-memory blueprint (golden targets) from entire scene
+        GOLDEN_TARGETS.clear()
+        depsgraph = context.evaluated_depsgraph_get()
+        for obj in scene.objects:
+            if obj.type != 'MESH':
+                continue
+            t_hash = NFIX_AlignmentLogic.get_texture_hash(obj)
+            t_pts = NFIX_AlignmentLogic.get_evaluated_world_points(obj, depsgraph)
+            if t_pts.shape[0] > 0:
+                GOLDEN_TARGETS.setdefault(t_hash, []).append(t_pts)
 
-        self.report({'INFO'}, f"Deleted {deleted} duplicate Ninja mesh(es) (tol={tol}).")
-
-        # ← Insert here:
-        # Count how many Ninja meshes remain
-        remaining = sum(1 for ob in scene.objects
-                        if ob.type == 'MESH' and '_' in ob.name and '.' not in ob.name)
-        print(f"[NinjaFix] {remaining} ninja mesh(es) remain in the scene.")
-
+        self.report({'INFO'}, "Force Capture 1 created and blueprint cached.")
         return {'FINISHED'}
 
-class NFIX_OT_ClearAllSelections(Operator):
-    bl_idname = "nfix.clear_all_selections"
-    bl_label  = "Clear All Selections"
-    bl_description = "Deselect the Ninja/Remix meshes and clear all picked vertices"
+# =================================================================================================
+# STAGE 4: PROCESS ALL OTHER CAPTURES
+# =================================================================================================
+class NFIX_OT_ProcessAllCaptures(Operator):
+    bl_idname      = "nfix.process_all_captures"
+    bl_label       = "Process All Captures"
+    bl_options     = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return NUMPY_INSTALLED and len(CAPTURE_SETS) > 1 and bool(GOLDEN_TARGETS)
+
+    def execute(self, context):
+        global INITIAL_ALIGN_MATRIX, GOLDEN_TARGETS
+
+        if not GOLDEN_TARGETS:
+            self.report({'ERROR'}, "No cached target data found. Run Stage 2 first.")
+            return {'CANCELLED'}
+
+        depsgraph = context.evaluated_depsgraph_get()
+        tol = 0.05  # max allowed vertex distance
+        aligned_count = 0
+        skipped = 0
+
+        for cap in CAPTURE_SETS[1:]:
+            ninjas = [
+                context.scene.objects.get(n)
+                for n in cap['objects']
+                if is_ninja(context.scene.objects.get(n))
+            ]
+            # try largest mesh first
+            ninjas.sort(key=lambda o: len(o.data.vertices) if o else 0, reverse=True)
+
+            matched = False
+            for src in ninjas:
+                if src is None: continue
+                pts = NFIX_AlignmentLogic.get_evaluated_world_points(src, depsgraph)
+                if pts.shape[0] == 0:
+                    continue
+
+                # skip perfectly symmetric shapes (two eigenvalues within 1%)
+                cov = np.cov(pts.T)
+                eig = np.linalg.eigvalsh(cov)
+                eig.sort()
+                if (eig[1] - eig[0]) / eig[2] < 0.01 or (eig[2] - eig[1]) / eig[2] < 0.01:
+                    continue
+
+                src_hash = NFIX_AlignmentLogic.get_texture_hash(src)
+                if src_hash not in GOLDEN_TARGETS:
+                    continue
+
+                # test each cached target
+                for tgt_pts in GOLDEN_TARGETS[src_hash]:
+                    if pts.shape != tgt_pts.shape:
+                        continue
+
+                    Mtest = NFIX_AlignmentLogic.solve_alignment(pts, tgt_pts)
+                    pts_h = np.hstack([pts, np.ones((pts.shape[0], 1))])
+                    aligned = (pts_h @ np.array(Mtest).T)[:, :3]
+
+                    # max per-vertex error
+                    dists = np.linalg.norm(aligned - tgt_pts, axis=1)
+                    if dists.max() < tol:
+                        # FIXED: Apply the complete transformation directly
+                        # instead of compounding with existing matrix
+                        for nm in cap['objects']:
+                            ob = context.scene.objects.get(nm)
+                            if is_ninja(ob):
+                                if "ninjafix_prev_matrix" not in ob:
+                                    ob["ninjafix_prev_matrix"] = mat_to_list(ob.matrix_world)
+                                
+                                # CORRECTED: Apply the full transformation matrix directly
+                                # instead of Mtest @ current matrix
+                                ob.matrix_world = Mtest
+                                
+                                # Optional: Apply non-uniform scale if needed
+                                # loc, rot, scale = Mtest.decompose()
+                                # ob.scale = scale
+                                
+                        cap['reference_mesh'] = src.name
+                        self.report({'INFO'},
+                            f"'{cap['name']}': aligned via '{src.name}' (max-dist={dists.max():.4f})")
+                        aligned_count += 1
+                        matched = True
+                        break
+
+                if matched:
+                    break
+
+            if not matched:
+                self.report({'WARNING'}, f"'{cap['name']}': no suitable non-symmetrical anchor found, skipped.")
+                skipped += 1
+
+        # update scene property
+        context.scene["ninjafix_capture_sets"] = json.dumps([
+            {'name': c['name'], 'objects': list(c['objects']), 'reference_mesh': c.get('reference_mesh','')}
+            for c in CAPTURE_SETS
+        ])
+
+        self.report({'INFO'},
+            f"Processing complete: {aligned_count} aligned, {skipped} skipped.")
+        return {'FINISHED'}
+
+# =================================================================================================
+# Other Operators & UI
+# =================================================================================================
+# (These classes remain mostly unchanged, but are included for a complete script)
+
+class NFIX_OT_UndoLastTransform(Operator):
+    bl_idname = "nfix.undo_last_transform"
+    bl_label = "Undo Last Transform"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        restored = 0
+        for ob in context.scene.objects:
+            if "ninjafix_prev_matrix" in ob:
+                vals = ob["ninjafix_prev_matrix"]
+                ob.matrix_world = Matrix([vals[i*4:(i+1)*4] for i in range(4)])
+                del ob["ninjafix_prev_matrix"]
+                restored += 1
+        self.report({'INFO'}, f"Restored {restored} Ninja mesh transforms.")
+        return {'FINISHED'}
+
+class NFIX_OT_SetCurrentCapture(Operator):
+    bl_idname = "nfix.set_current_capture"
+    bl_label = "Add New Capture"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        st = context.scene.ninjafix_settings
+        ninjas = current_ninja_set(context.scene)
+        recorded = set().union(*(c['objects'] for c in CAPTURE_SETS))
+        unrec = ninjas - recorded
+        if not unrec:
+            self.report({'WARNING'}, "No new Ninja meshes found to add as a capture.")
+            return {'CANCELLED'}
+        name = f"Capture {len(CAPTURE_SETS) + 1}"
+        CAPTURE_SETS.append({'name': name, 'objects': unrec, 'reference_mesh': ''})
+        context.scene["ninjafix_capture_sets"] = json.dumps([{'name': c['name'], 'objects': list(c['objects']), 'reference_mesh': c.get('reference_mesh','')} for c in CAPTURE_SETS])
+        self.report({'INFO'}, f"Added {name} with {len(unrec)} meshes.")
+        return {'FINISHED'}
 
-        # Clear mesh selections
-        st.source_obj = None
-        st.target_obj = None
-
-        # Clear all vertex picks
-        bpy.ops.nfix.clear_all_points()
-
-        self.report({'INFO'}, "Cleared mesh selections and all vertex picks.")
+class NFIX_OT_RemoveCapture(Operator):
+    bl_idname = "nfix.remove_capture"
+    bl_label = "X"
+    bl_options = {'REGISTER', 'UNDO'}
+    capture_name: StringProperty()
+    def execute(self, context):
+        global CAPTURE_SETS
+        CAPTURE_SETS = [c for c in CAPTURE_SETS if c['name'] != self.capture_name]
+        context.scene["ninjafix_capture_sets"] = json.dumps([{'name': c['name'], 'objects': list(c['objects']), 'reference_mesh': c.get('reference_mesh','')} for c in CAPTURE_SETS])
         return {'FINISHED'}
 
 class VIEW3D_PT_NinjaFix_Aligner(Panel):
@@ -303,90 +662,104 @@ class VIEW3D_PT_NinjaFix_Aligner(Panel):
 
     def draw(self, context):
         layout = self.layout
-        st     = context.scene.ninjafix_settings
+        st = context.scene.ninjafix_settings
 
-        # Dependency
         if not NUMPY_INSTALLED:
-            box = layout.box()
-            box.label(text="NumPy required", icon='ERROR')
-            box.operator(NFIX_OT_InstallNumpy.bl_idname, icon='CONSOLE')
+            layout.operator('nfix.install_numpy', icon='ERROR')
+            layout.label(text="Restart Blender after installation.")
             return
 
-        # Stage 1: Setup
-        box1 = layout.box()
-        box1.label(text="Stage 1: Setup", icon='OBJECT_DATA')
-        col  = box1.column()
-        col.enabled = (context.mode == 'OBJECT')
-        col.label(text="Select one Ninja and one Remix mesh, then:")
-        col.operator(NFIX_OT_SetObjects.bl_idname, icon='CHECKMARK')
-        # Clear button beneath
-        col.operator(NFIX_OT_ClearAllSelections.bl_idname, icon='X', text="Clear All Selections")
-        if st.source_obj and st.target_obj:
-            box1.label(text=f"Ninja Source: {st.source_obj.name}", icon='MESH_CUBE')
-            box1.label(text=f"Remix Target: {st.target_obj.name}", icon='MESH_UVSPHERE')
+        # Stage 1: Select Meshes
+        box = layout.box()
+        box.label(text="Stage 1: Select Meshes", icon='OBJECT_DATA')
+        col = box.column()
+        col.operator('nfix.set_objects', icon='CHECKMARK')
+        if st.source_obj:
+            box.label(text=f"Ninja: {st.source_obj.name}", icon='MOD_MESHDEFORM')
+        if st.target_obj:
+            box.label(text=f"Remix: {st.target_obj.name}", icon='MESH_PLANE')
 
-        # Stage 2: Pick Vertices
-        box2 = layout.box()
-        box2.label(text="Stage 2: Pick Vertices", icon='RESTRICT_SELECT_OFF')
+        # Stage 2: Initial Alignment
+        box = layout.box()
+        box.label(text="Stage 2: Initial Alignment", icon='PLAY')
+        box.enabled = bool(st.source_obj and st.target_obj)
+        box.operator('nfix.calculate_and_batch_fix', text="Generate & Apply Fix", icon='ROTATE')
 
-        sequence = [f"{p}_v{i}" for i in range(1,5) for p in ("remix","ninja")]
-        next_prop = next((p for p in sequence if not getattr(st, p + "_picked")), None)
+        # Stage 3: Manage Captures
+        box = layout.box()
+        box.label(text="Stage 3: Manage Captures", icon='BOOKMARKS')
+        # reload from scene prop if needed
+        if not CAPTURE_SETS and "ninjafix_capture_sets" in context.scene:
+            try:
+                CAPTURE_SETS[:] = json.loads(context.scene["ninjafix_capture_sets"])
+            except:
+                pass
 
-        # show completed with clear buttons
-        for p in sequence:
-            if getattr(st, p + "_picked"):
-                row = box2.row(align=True)
-                row.label(text=f"✓ {p.replace('_',' ').title()}", icon='CHECKMARK')
-                clr = row.operator(NFIX_OT_ClearSinglePoint.bl_idname, text="", icon='X')
-                clr.target_prop_name = p
+        for cap in CAPTURE_SETS:
+            row = box.row(align=True)
+            ref = cap.get('reference_mesh', '') or '—'
+            row.label(
+                text=f"{cap['name']}: {ref}",
+                icon='CHECKMARK' if cap.get('reference_mesh') else 'QUESTION'
+            )
+            op = row.operator('nfix.remove_capture', text="", icon='X')
+            op.capture_name = cap['name']
 
-        # pick button for next
-        if next_prop:
-            box2.separator()
-            row = box2.row()
-            row.enabled = context.mode.startswith("EDIT")
-            op = row.operator(NFIX_OT_ConfirmVertex.bl_idname,
-                              text=f"Pick {next_prop.replace('_',' ').title()}",
-                              icon='MESH_DATA')
-            op.target_prop_name = next_prop
-            if not context.mode.startswith("EDIT"):
-                box2.label(text="(Enter Edit Mode on Ninja or Remix mesh)", icon='INFO')
+        # If we have no captures yet, show Force Capture 1
+        if not CAPTURE_SETS:
+            box.operator('nfix.force_capture1', icon='BOOKMARKS', text="Force Capture 1")
         else:
-            box2.label(text="All vertices picked ✓", icon='CHECKMARK')
+            box.operator('nfix.set_current_capture', text="Add New Capture", icon='ADD')
 
-        # Stage 3: Calculate & Apply
-        box3 = layout.box()
-        box3.enabled = st.are_all_points_picked()
-        box3.label(text="Stage 3: Apply Transformation", icon='PLAY')
-        row = box3.row()
-        row.scale_y = 1.5
-        row.operator(NFIX_OT_CalculateAndBatchFix.bl_idname, text="Generate & Apply Fix")
+        # Stage 4: Process All & Cleanup
+        box = layout.box()
+        box.label(text="Stage 4: Process All", icon='FILE_TICK')
+        box.operator('nfix.process_all_captures', text="Process All Captures", icon='CHECKMARK')
+        box.operator('nfix.undo_last_transform', text="Undo Last Transform", icon='LOOP_BACK')
+        # NEW button to delete duplicates using mat_ rule
+        box.operator('nfix.remove_mat_duplicates', text="Remove mat_ Duplicates", icon='TRASH')
 
-        # <— NEW: delete duplicates button appears once transform is applied
-        del_row = box3.row()
-        del_row.enabled = True
-        del_row.operator(NFIX_OT_DeleteDuplicateNinjas.bl_idname, icon='TRASH')
-
-# --- Registration ---
-
+# =================================================================================================
+# Registration
+# =================================================================================================
 classes = (
     NinjaFixSettings,
     NFIX_OT_InstallNumpy,
     NFIX_OT_SetObjects,
-    NFIX_OT_ClearAllSelections,      # ← newly added
-    NFIX_OT_ConfirmVertex,
-    NFIX_OT_ClearSinglePoint,
-    NFIX_OT_ClearAllPoints,
     NFIX_OT_CalculateAndBatchFix,
-    NFIX_OT_DeleteDuplicateNinjas,
+    NFIX_OT_ForceCapture1,
+    NFIX_OT_ProcessAllCaptures,
+    NFIX_OT_UndoLastTransform,
+    NFIX_OT_SetCurrentCapture,
+    NFIX_OT_RemoveCapture,
+    NFIX_OT_RemoveMatDuplicates,    # ← add this
     VIEW3D_PT_NinjaFix_Aligner,
 )
 
-
+# =================================================================================================
+# Registration (with reload of saved matrix)
+# =================================================================================================
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.ninjafix_settings = PointerProperty(type=NinjaFixSettings)
+
+    # === Restore saved alignment matrix (only if a .blend is open) ===
+    try:
+        blend_file = bpy.data.filepath
+        # only proceed if we actually have a blend path
+        if blend_file:
+            db_entry = load_db().get(blend_file, {})
+            mat_list = db_entry.get("matrix")
+            if mat_list:
+                from mathutils import Matrix
+                global INITIAL_ALIGN_MATRIX
+                INITIAL_ALIGN_MATRIX = Matrix([
+                    mat_list[i*4:(i+1)*4] for i in range(4)
+                ])
+    except Exception:
+        # bpy.data may be restricted during addon enable; ignore in that case
+        pass
 
 def unregister():
     del bpy.types.Scene.ninjafix_settings
