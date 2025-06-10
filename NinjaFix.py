@@ -12,17 +12,20 @@ import bpy
 import bmesh
 import sys, subprocess
 from bpy.props import PointerProperty, StringProperty, BoolProperty, IntProperty
-from bpy.types import PropertyGroup, Operator, Panel
+from bpy.types import PropertyGroup, Operator, Panel, UIList
 import json
 from mathutils import Vector, Matrix, kdtree
 import hashlib
 import os
 import numpy as np
+from bpy.props import CollectionProperty
+from bpy.types import OperatorFileListElement
 
 # --- Globals ---
 CAPTURE_SETS = []
 INITIAL_ALIGN_MATRIX = None
 GOLDEN_TARGETS = {} # NEW: To store the 'snapshot' of target points
+PREFERRED_ANCHOR_HASHES = set()
 
 # --- Dependency Check ---
 try:
@@ -435,6 +438,16 @@ class NinjaFixSettings(PropertyGroup):
         default=False,
         update=toggle_auto_capture_timer
     )
+    import_folders: BoolProperty(
+        name="Import From Folders",
+        description="Show the multi-folder import controls",
+        default=False
+    )
+    flip_geometry: BoolProperty(
+        name="Flip Geometry",
+        description="Flip geometry on import (use right-handed projection)",
+        default=False
+    )
 
 class NFIX_OT_InstallNumpy(Operator):
     bl_idname = "nfix.install_numpy"
@@ -537,7 +550,7 @@ class NFIX_OT_CalculateAndBatchFix(Operator):
         return NUMPY_INSTALLED and st.source_obj and st.target_obj
 
     def execute(self, context):
-        global INITIAL_ALIGN_MATRIX, GOLDEN_TARGETS
+        global INITIAL_ALIGN_MATRIX, GOLDEN_TARGETS, PREFERRED_ANCHOR_HASHES
 
         st = context.scene.ninjafix_settings
         depsgraph = context.evaluated_depsgraph_get()
@@ -563,6 +576,11 @@ class NFIX_OT_CalculateAndBatchFix(Operator):
         }
         save_db(db)
         self.report({'INFO'}, f"Saved full alignment matrix and scale to DB for {blend_file}")
+
+        # NEW: Add the initial anchor's hash to the preferred set
+        initial_anchor_hash = NFIX_AlignmentLogic.get_texture_hash(st.source_obj)
+        if initial_anchor_hash:
+            PREFERRED_ANCHOR_HASHES.add(initial_anchor_hash)
 
         # --- apply M0 to your first capture ---
         first_set = current_ninja_set(context.scene)
@@ -649,7 +667,7 @@ class NFIX_OT_ProcessAllCaptures(Operator):
         return NUMPY_INSTALLED and len(CAPTURE_SETS) > 1 and bool(GOLDEN_TARGETS)
 
     def execute(self, context):
-        global INITIAL_ALIGN_MATRIX, GOLDEN_TARGETS
+        global INITIAL_ALIGN_MATRIX, GOLDEN_TARGETS, PREFERRED_ANCHOR_HASHES
 
         if not GOLDEN_TARGETS:
             self.report({'ERROR'}, "No cached target data found. Run Stage 2 first.")
@@ -661,17 +679,35 @@ class NFIX_OT_ProcessAllCaptures(Operator):
         skipped = 0
 
         for cap in CAPTURE_SETS[1:]:
-            ninjas = [
+            # Get all ninja objects for the current capture
+            all_ninjas_in_cap = [
                 context.scene.objects.get(n)
                 for n in cap['objects']
                 if is_ninja(context.scene.objects.get(n))
             ]
-            # try largest mesh first
-            ninjas.sort(key=lambda o: len(o.data.vertices) if o else 0, reverse=True)
 
+            # NEW: Prioritize ninjas based on PREFERRED_ANCHOR_HASHES
+            preferred_ninjas = []
+            other_ninjas = []
+            for o in all_ninjas_in_cap:
+                if o is None: continue
+                h = NFIX_AlignmentLogic.get_texture_hash(o)
+                # Check if hash is valid and in the preferred set
+                if h and h in PREFERRED_ANCHOR_HASHES:
+                    preferred_ninjas.append(o)
+                else:
+                    other_ninjas.append(o)
+            
+            # Sort the remaining ninjas by vertex count as a fallback
+            other_ninjas.sort(key=lambda o: len(o.data.vertices) if o else 0, reverse=True)
+
+            # The final list to iterate over, with preferred anchors first
+            ninjas_to_try = preferred_ninjas + other_ninjas
+            
             matched = False
-            for src in ninjas:
+            for src in ninjas_to_try:
                 if src is None: continue
+                
                 pts = NFIX_AlignmentLogic.get_evaluated_world_points(src, depsgraph)
                 if pts.shape[0] == 0:
                     continue
@@ -699,23 +735,29 @@ class NFIX_OT_ProcessAllCaptures(Operator):
                     # max per-vertex error
                     dists = np.linalg.norm(aligned - tgt_pts, axis=1)
                     if dists.max() < tol:
+                        # Successful alignment, apply the transform to all objects in the capture
                         for nm in cap['objects']:
                             ob = context.scene.objects.get(nm)
                             if is_ninja(ob):
                                 if "ninjafix_prev_matrix" not in ob:
                                     ob["ninjafix_prev_matrix"] = mat_to_list(ob.matrix_world)
                                 
-                                # FIX: Apply transformation relative to current matrix
-                                ob.matrix_world = Mtest @ ob.matrix_world  # CORRECTED LINE
-                                
+                                ob.matrix_world = Mtest @ ob.matrix_world
+                        
+                        # NEW: Add the successful anchor hash to the preferred set for next captures
+                        successful_hash = NFIX_AlignmentLogic.get_texture_hash(src)
+                        if successful_hash:
+                            PREFERRED_ANCHOR_HASHES.add(successful_hash)
+
                         cap['reference_mesh'] = src.name
                         self.report({'INFO'},
                             f"'{cap['name']}': aligned via '{src.name}' (max-dist={dists.max():.4f})")
                         aligned_count += 1
                         matched = True
-                        break
+                        break # Exit the inner loop (tgt_pts)
+                
                 if matched:
-                    break
+                    break # Exit the outer loop (src)
 
             if not matched:
                 self.report({'WARNING'}, f"'{cap['name']}': no suitable non-symmetrical anchor found, skipped.")
@@ -770,6 +812,141 @@ class NFIX_OT_SetCurrentCapture(Operator):
         self.report({'INFO'}, f"Added {name} with {len(unrec)} meshes.")
         return {'FINISHED'}
 
+# 1) PropertyGroup for each folder entry
+class NFIX_FolderItem(PropertyGroup):
+    name: StringProperty()
+    path: StringProperty()
+    use: BoolProperty(default=False)
+
+# 3) Operator to scan subfolders
+class NFIX_OT_ScanCaptureFolders(Operator):
+    bl_idname = "nfix.scan_capture_folders"
+    bl_label = "Scan Subfolders"
+    bl_description = "Scan the selected parent directory for subfolders (or .nr files) to import"
+
+    def execute(self, context):
+        scene = context.scene
+        parent = scene.nfix_parent_dir
+        scene.nfix_folder_items.clear()
+        if not parent or not os.path.isdir(parent):
+            self.report({'ERROR'}, "Please set a valid parent directory.")
+            return {'CANCELLED'}
+        try:
+            entries = os.listdir(parent)
+        except Exception as e:
+            self.report({'ERROR'}, f"Cannot list directory: {e}")
+            return {'CANCELLED'}
+        # First, add each subfolder
+        subfolder_count = 0
+        for name in sorted(entries):
+            full = os.path.join(parent, name)
+            if os.path.isdir(full):
+                item = scene.nfix_folder_items.add()
+                item.name = name
+                item.path = full
+                item.use = False
+                subfolder_count += 1
+        # If no subfolders found but .nr files exist directly, add a special "parent files" entry
+        if subfolder_count == 0:
+            nr_files = [f for f in entries if f.lower().endswith('.nr')]
+            if nr_files:
+                item = scene.nfix_folder_items.add()
+                item.name = "<Parent .nr Files>"
+                item.path = parent
+                item.use = False
+                self.report({'INFO'}, f"Found {len(nr_files)} .nr files in parent folder.")
+        if subfolder_count == 0 and not scene.nfix_folder_items:
+            self.report({'WARNING'}, "No subfolders or .nr files found.")
+        else:
+            if subfolder_count > 0:
+                self.report({'INFO'}, f"Found {subfolder_count} subfolders.")
+        return {'FINISHED'}
+
+# 4) UIList to display folders
+class NFIX_UL_FolderList(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        # data is the CollectionProperty owner, item is NFIX_FolderItem
+        split = layout.split(factor=0.1)
+        split.prop(item, "use", text="")
+        split.label(text=item.name, translate=False, icon='FILE_FOLDER')
+
+# 5) Operator to import selected folders
+class NFIX_OT_ImportSelectedFolders(Operator):
+    bl_idname = "nfix.import_selected_folders"
+    bl_label = "Import Selected Folders"
+    bl_description = "Import Ninja meshes from the checked subfolders"
+
+    @classmethod
+    def poll(cls, context):
+        st = context.scene.ninjafix_settings
+        return st.import_folders and bool(context.scene.nfix_folder_items)
+
+    def execute(self, context):
+        scene = context.scene
+        st = scene.ninjafix_settings
+        selected = [item for item in scene.nfix_folder_items if item.use]
+        if not selected:
+            self.report({'WARNING'}, "No folders selected.")
+            return {'CANCELLED'}
+
+        if not hasattr(bpy.ops.import_mesh, "nr"):
+            self.report({'ERROR'}, "Ninja Ripper importer (import_mesh.nr) not found.")
+            return {'CANCELLED'}
+
+        imported = 0
+        for item in selected:
+            folder = item.path
+            if not os.path.isdir(folder):
+                self.report({'WARNING'}, f"Not a directory: {item.name}")
+                continue
+
+            # capture current meshes, import batch, then diff once per folder
+            before = current_ninja_set(scene)
+            nr_files = [f for f in os.listdir(folder) if f.lower().endswith(".nr")]
+            if not nr_files:
+                self.report({'WARNING'}, f"No .nr files in '{item.name}'.")
+                continue
+
+            files_param = [{"name": fn} for fn in nr_files]
+            bpy.ops.import_mesh.nr(
+                directory=folder,
+                files=files_param,
+                loadExtraUvData=True,
+                projFov_useRH=st.flip_geometry
+            )
+
+            after = current_ninja_set(scene)
+            new_meshes = after - before
+            if new_meshes:
+                imported += 1
+                capture_name = f"Capture {len(CAPTURE_SETS) + 1}"
+                CAPTURE_SETS.append({
+                    "name": capture_name,
+                    "objects": new_meshes,
+                    "reference_mesh": ""
+                })
+                self.report(
+                    {'INFO'},
+                    f"Imported {len(new_meshes)} meshes from '{item.name}' as {capture_name}."
+                )
+
+        if imported:
+            scene["ninjafix_capture_sets"] = json.dumps([
+                {
+                    "name": cap["name"],
+                    "objects": list(cap["objects"]),
+                    "reference_mesh": cap.get("reference_mesh", "")
+                }
+                for cap in CAPTURE_SETS
+            ])
+            for area in context.screen.areas:
+                if area.type == "VIEW_3D":
+                    for region in area.regions:
+                        if region.type == "UI":
+                            region.tag_redraw()
+
+        return {'FINISHED'}
+
 class NFIX_OT_RemoveCapture(Operator):
     bl_idname = "nfix.remove_capture"
     bl_label = "X"
@@ -792,6 +969,7 @@ class VIEW3D_PT_NinjaFix_Aligner(Panel):
         layout = self.layout
         st = context.scene.ninjafix_settings
 
+        # Stage 1: Select Meshes
         if not NUMPY_INSTALLED:
             layout.operator('nfix.install_numpy', icon='ERROR')
             layout.label(text="Restart Blender after installation.")
@@ -800,26 +978,49 @@ class VIEW3D_PT_NinjaFix_Aligner(Panel):
         box = layout.box()
         box.label(text="Stage 1: Select Meshes", icon='OBJECT_DATA')
         box.operator('nfix.set_objects', icon='CHECKMARK')
-        if st.source_obj: box.label(text=f"Ninja: {st.source_obj.name}", icon='MOD_MESHDEFORM')
-        if st.target_obj: box.label(text=f"Remix: {st.target_obj.name}", icon='MESH_PLANE')
+        if st.source_obj:
+            box.label(text=f"Ninja: {st.source_obj.name}", icon='MOD_MESHDEFORM')
+        if st.target_obj:
+            box.label(text=f"Remix: {st.target_obj.name}", icon='MESH_PLANE')
 
+        # Stage 2: Initial Alignment
         box = layout.box()
         box.label(text="Stage 2: Initial Alignment", icon='PLAY')
         box.enabled = bool(st.source_obj and st.target_obj)
         box.operator('nfix.calculate_and_batch_fix', text="Generate & Apply Fix", icon='ROTATE')
 
+        # Stage 3: Manage Captures
         box = layout.box()
         box.label(text="Stage 3: Manage Captures", icon='BOOKMARKS')
-        box.prop(st, "auto_capture") # <-- NEW CHECKBOX
-        
+        box.prop(st, "auto_capture")
+
+        # Import From Folders toggle + UI
+        box.prop(st, "import_folders", text="Import From Folders", icon='FILE_FOLDER')
+        if st.import_folders:
+            box.prop(st, "flip_geometry", text="Flip Geometry")
+            box.prop(context.scene, "nfix_parent_dir", text="Parent Folder")
+            box.operator("nfix.scan_capture_folders", icon='FILE_FOLDER')
+            box.template_list(
+                "NFIX_UL_FolderList", "",
+                context.scene, "nfix_folder_items",
+                context.scene, "nfix_folder_index",
+                rows=4
+            )
+            box.operator("nfix.import_selected_folders", icon='IMPORT')
+
+
+        # Existing capture sets listing
         if not CAPTURE_SETS and "ninjafix_capture_sets" in context.scene:
-            try: CAPTURE_SETS[:] = json.loads(context.scene["ninjafix_capture_sets"])
-            except: pass
+            try:
+                CAPTURE_SETS[:] = json.loads(context.scene["ninjafix_capture_sets"])
+            except:
+                pass
 
         for cap in CAPTURE_SETS:
             row = box.row(align=True)
             ref = cap.get('reference_mesh', '') or '—'
-            row.label(text=f"{cap['name']}: {ref}", icon='CHECKMARK' if cap.get('reference_mesh') else 'QUESTION')
+            icon = 'CHECKMARK' if cap.get('reference_mesh') else 'QUESTION'
+            row.label(text=f"{cap['name']}: {ref}", icon=icon)
             op = row.operator('nfix.remove_capture', text="", icon='X')
             op.capture_name = cap['name']
 
@@ -828,6 +1029,7 @@ class VIEW3D_PT_NinjaFix_Aligner(Panel):
         else:
             box.operator('nfix.set_current_capture', text="Add New Capture", icon='ADD')
 
+        # Stage 4: Process All & Cleanup
         box = layout.box()
         box.label(text="Stage 4: Process All & Cleanup", icon='FILE_TICK')
         box.operator('nfix.process_all_captures', text="Process All Captures", icon='CHECKMARK')
@@ -839,8 +1041,12 @@ class VIEW3D_PT_NinjaFix_Aligner(Panel):
 # =================================================================================================
 classes = (
     NinjaFixSettings,
+    NFIX_FolderItem,
     NFIX_OT_InstallNumpy,
     NFIX_OT_SetObjects,
+    NFIX_OT_ScanCaptureFolders,
+    NFIX_UL_FolderList,
+    NFIX_OT_ImportSelectedFolders,
     NFIX_OT_CalculateAndBatchFix,
     NFIX_OT_ForceCapture1,
     NFIX_OT_ProcessAllCaptures,
@@ -848,7 +1054,7 @@ classes = (
     NFIX_OT_SetCurrentCapture,
     NFIX_OT_RemoveCapture,
     NFIX_OT_RemoveMatDuplicates,
-    NFIX_OT_AutoCaptureTimer, # <-- Register new operator
+    NFIX_OT_AutoCaptureTimer,
     VIEW3D_PT_NinjaFix_Aligner,
 )
 
@@ -856,8 +1062,20 @@ classes = (
 # Registration (with reload of saved matrix)
 # =================================================================================================
 def register():
+    # 1) register all classes
     for cls in classes:
         bpy.utils.register_class(cls)
+
+    # 2) define the new Scene-level props for the folder UI
+    bpy.types.Scene.nfix_parent_dir = StringProperty(
+        name="Parent Folder",
+        description="Select the parent directory containing capture subfolders",
+        subtype='DIR_PATH'
+    )
+    bpy.types.Scene.nfix_folder_items = CollectionProperty(type=NFIX_FolderItem)
+    bpy.types.Scene.nfix_folder_index = IntProperty()
+
+    # 3) your existing NinjaFixSettings registration
     bpy.types.Scene.ninjafix_settings = PointerProperty(type=NinjaFixSettings)
 
     # === Restore saved alignment matrix (only if a .blend is open) ===
@@ -878,7 +1096,15 @@ def register():
         pass
 
 def unregister():
+    # remove our Scene props
+    del bpy.types.Scene.nfix_parent_dir
+    del bpy.types.Scene.nfix_folder_items
+    del bpy.types.Scene.nfix_folder_index
+
+    # remove the old settings pointer
     del bpy.types.Scene.ninjafix_settings
+
+    # unregister classes in reverse
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
