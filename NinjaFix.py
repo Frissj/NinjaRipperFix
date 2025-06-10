@@ -183,7 +183,7 @@ class NFIX_OT_RemoveMatDuplicates(Operator):
     def execute(self, context):
         """
         Deletes meshes that are duplicates in GEOMETRY AND LOCATION (World Space),
-        with extensive debugging to trace why meshes may not be deleted.
+        with caching of evaluated points, KD-trees, and material-hash checks.
         """
         import numpy as np
         from mathutils import Matrix, kdtree
@@ -196,69 +196,108 @@ class NFIX_OT_RemoveMatDuplicates(Operator):
         print("\n================ NinjaFix DEBUG START ================")
         print(f"[DEBUG] Tolerance for duplicate detection: {tol}")
 
-        # 1) Collect world-space points for each mesh
-        mesh_entries = []
+        # ---------------------------------------------------------------------
+        # 1) PRECOMPUTE & CACHE: world-space points, KD-trees, mat-hash flags
+        # ---------------------------------------------------------------------
+        world_pts_cache = {}
+        kd_cache        = {}
+        matflag_cache   = {}
+        entries         = []
+        hash_pat        = re.compile(r"^mat_[A-F0-9]{6,}$", re.I)
+
+        def has_normal_mat(obj):
+            if obj.name in matflag_cache:
+                return matflag_cache[obj.name]
+            # determine if object has a "normal" material
+            for slot in obj.material_slots:
+                mat = slot.material
+                if mat is None or not hash_pat.fullmatch(mat.name):
+                    matflag_cache[obj.name] = True
+                    return True
+            matflag_cache[obj.name] = not obj.material_slots
+            return matflag_cache[obj.name]
+
+        # collect meshes
         for ob in list(scene.objects):
             if ob.type != 'MESH':
                 continue
-            pts = NFIX_AlignmentLogic.get_evaluated_world_points(ob, depsgraph)
-            # Debug: vertex count
-            name = ob.name  # store name for debug
-            print(f"[DEBUG] Object '{name}': vertex count = {pts.shape[0]}")
-            if pts.shape[0] == 0:
-                print(f"[DEBUG] Skipping '{name}' (no vertices)")
+
+            # cache world points
+            pts = world_pts_cache.get(ob.name)
+            if pts is None:
+                pts = NFIX_AlignmentLogic.get_evaluated_world_points(ob, depsgraph)
+                world_pts_cache[ob.name] = pts
+
+            vcount = pts.shape[0]
+            print(f"[DEBUG] Object '{ob.name}': vertex count = {vcount}")
+            if vcount == 0:
                 continue
-            mesh_entries.append({'obj': ob, 'pts': pts})
-        n = len(mesh_entries)
+
+            # build KD-tree once and cache it
+            kd = kd_cache.get(ob.name)
+            if kd is None:
+                kd = kdtree.KDTree(vcount)
+                for idx, co in enumerate(pts):
+                    kd.insert(co, idx)
+                kd.balance()
+                kd_cache[ob.name] = kd
+
+            entries.append({
+                'obj': ob,
+                'pts': pts,
+                'vcount': vcount,
+                'kd': kd,
+                'has_normal': has_normal_mat(ob),
+            })
+
+        n = len(entries)
         print(f"[DEBUG] Total meshes considered: {n}")
         if n < 2:
             self.report({'WARNING'}, "Not enough meshes to compare.")
             print("================ NinjaFix DEBUG END ================\n")
             return {'CANCELLED'}
 
-        # 2) Build adjacency by KD-tree nearest-neighbor check
+        # ---------------------------------------------------------------------
+        # 2) GROUP BY vertex count to skip mismatches
+        # ---------------------------------------------------------------------
+        groups = {}
+        for idx, ent in enumerate(entries):
+            groups.setdefault(ent['vcount'], []).append(idx)
+
+        # ---------------------------------------------------------------------
+        # 3) PAIRWISE KD-CHECK WITH CACHED TREES
+        # ---------------------------------------------------------------------
         adj = {i: set() for i in range(n)}
-        for i in range(n):
-            ob_i = mesh_entries[i]['obj']
-            pts_i = mesh_entries[i]['pts']
-            name_i = ob_i.name
-            for j in range(i + 1, n):
-                ob_j = mesh_entries[j]['obj']
-                pts_j = mesh_entries[j]['pts']
-                name_j = ob_j.name
-                print(f"\n[DEBUG] Comparing '{name_i}' vs '{name_j}'")
-                if pts_i.shape[0] != pts_j.shape[0]:
-                    print(f"[DEBUG] Vertex count mismatch ({pts_i.shape[0]} vs {pts_j.shape[0]}), skipping")
-                    continue
+        for vcount, idxs in groups.items():
+            if len(idxs) < 2:
+                continue
+            print(f"[DEBUG] Comparing {len(idxs)} meshes with {vcount} verts each")
+            for ii in range(len(idxs)):
+                i = idxs[ii]
+                pts_i = entries[i]['pts']
+                name_i = entries[i]['obj'].name
+                for jj in range(ii + 1, len(idxs)):
+                    j = idxs[jj]
+                    name_j = entries[j]['obj'].name
+                    print(f"\n[DEBUG] Comparing '{name_i}' vs '{name_j}'")
+                    kd_j = entries[j]['kd']
+                    max_err = 0.0
+                    for co in pts_i:
+                        _, _, d = kd_j.find(co)
+                        if d > max_err:
+                            max_err = d
+                            if max_err >= tol:
+                                print(f"[DEBUG] Early exit: d={d:.6f} >= tol")
+                                break
+                    print(f"[DEBUG] Max NN distance = {max_err:.6f}")
+                    if max_err < tol:
+                        adj[i].add(j)
+                        adj[j].add(i)
+                        print(f"[DEBUG] Marking duplicates (tol={tol:.6f})")
 
-                # build KD-tree on pts_j
-                size = pts_j.shape[0]
-                kd = kdtree.KDTree(size)
-                for idx, co in enumerate(pts_j):
-                    kd.insert(co, idx)
-                kd.balance()
-                print(f"[DEBUG] KD-tree built for '{name_j}' with {size} points")
-
-                # compute max NN distance from pts_i to pts_j
-                max_err = 0.0
-                for idx_i, co in enumerate(pts_i):
-                    _, _, d = kd.find(co)
-                    if d > max_err:
-                        max_err = d
-                    if max_err >= tol:
-                        print(f"[DEBUG] Early exit at pts_i[{idx_i}] d={d:.6f} >= tol")
-                        break
-                print(f"[DEBUG] Max NN distance = {max_err:.6f}")
-
-                if max_err < tol:
-                    adj[i].add(j)
-                    adj[j].add(i)
-                    print(f"[DEBUG] Marking as duplicates (within tol)")
-                else:
-                    print(f"[DEBUG] Not duplicates (exceeds tol)")
-
-        # 3) Find clusters (connected components)
-        print("\n[DEBUG] Building clusters from adjacency")
+        # ---------------------------------------------------------------------
+        # 4) BUILD CLUSTERS
+        # ---------------------------------------------------------------------
         visited = set()
         clusters = []
         for i in range(n):
@@ -278,99 +317,73 @@ class NFIX_OT_RemoveMatDuplicates(Operator):
             clusters.append(comp)
         print(f"[DEBUG] Found {len(clusters)} clusters:")
         for ci, comp in enumerate(clusters):
-            names = [mesh_entries[k]['obj'].name for k in comp]
+            names = [entries[k]['obj'].name for k in comp]
             print(f"  Cluster {ci}: {names}")
 
-        # 4) Select keeper and mark others for deletion
+        # ---------------------------------------------------------------------
+        # 5) SELECT KEEPERS & COLLECT FOR DELETION
+        # ---------------------------------------------------------------------
         to_delete = []
-        hash_pat = re.compile(r"^mat_[A-F0-9]{6,}$", re.I)
-        def has_normal(ob_local):
-            # Returns True if object has any material slot whose material name is not a mat_ hash,
-            # or if no material slots (assume 'normal')
-            if not ob_local.material_slots:
-                return True
-            for slot in ob_local.material_slots:
-                mat = slot.material
-                if mat is None:
-                    return True
-                if not hash_pat.fullmatch(mat.name):
-                    return True
-            return False
-
         for ci, comp in enumerate(clusters):
             if len(comp) < 2:
-                print(f"[DEBUG] Cluster {ci} has <2 members, skipping")
                 continue
-            entries = [mesh_entries[k] for k in comp]
-            names = [e['obj'].name for e in entries]
+            ents = [entries[k] for k in comp]
+            names = [e['obj'].name for e in ents]
             print(f"\n[DEBUG] Processing Cluster {ci}: {names}")
 
-            # choose keeper
             keeper = None
             reason = ""
-            # 1) pure Ninja: name starts with "mesh_" and no dot
-            for e in entries:
-                ob_e = e['obj']
-                name_e = ob_e.name
-                if name_e.startswith("mesh_") and "." not in name_e:
-                    keeper = ob_e
+            # 1) pure Ninja mesh (name starts with mesh_ and no dot)
+            for e in ents:
+                nm = e['obj'].name
+                if nm.startswith("mesh_") and "." not in nm:
+                    keeper = e['obj']
                     reason = "pure Ninja"
                     break
             # 2) has normal material
             if keeper is None:
-                for e in entries:
-                    ob_e = e['obj']
-                    if has_normal(ob_e):
-                        keeper = ob_e
+                for e in ents:
+                    if e['has_normal']:
+                        keeper = e['obj']
                         reason = "has normal material"
                         break
-            # 3) fallback: first in list
+            # 3) fallback
             if keeper is None:
-                keeper = entries[0]['obj']
+                keeper = ents[0]['obj']
                 reason = "first fallback"
-            print(f"[DEBUG] Keeper selected: '{keeper.name}' ({reason})")
+            print(f"[DEBUG] Keeper: '{keeper.name}' ({reason})")
 
-            # mark others
-            for e in entries:
+            for e in ents:
                 ob_e = e['obj']
                 if ob_e is not keeper:
                     print(f"[DEBUG] Marking '{ob_e.name}' for deletion")
                     to_delete.append(ob_e)
 
-        # 5) Apply transforms & delete
+        # ---------------------------------------------------------------------
+        # 6) BATCH DELETE SAFELY
+        # ---------------------------------------------------------------------
         deleted = 0
         print(f"\n[DEBUG] Deleting {len(to_delete)} objects:")
+        # We do all unlinks in one pass before removes to avoid modifying scene.objects mid-loop
         for ob in to_delete:
-            # Store needed properties before removal
-            obj_name = ob.name
-            # Debug print before removal
-            print(f"[DEBUG] Deleting '{obj_name}'")
-            # Bake matrix_world into mesh data to preserve transforms if needed
+            for coll in list(ob.users_collection):
+                coll.objects.unlink(ob)
+        for ob in to_delete:
+            name = ob.name
+            print(f"[DEBUG] Deleting '{name}'")
             if ob.type == 'MESH':
                 mat = ob.matrix_world.copy()
                 try:
                     ob.data.transform(mat)
                 except Exception as e:
-                    # If transform fails, still proceed
-                    print(f"[DEBUG] Warning: failed to bake transform for '{obj_name}': {e}")
+                    print(f"[DEBUG] Warn: bake failed for '{name}': {e}")
                 ob.matrix_world = Matrix.Identity(4)
-            # Unlink from collections
-            for coll in list(ob.users_collection):
-                try:
-                    coll.objects.unlink(ob)
-                except Exception as e:
-                    print(f"[DEBUG] Warning: failed to unlink '{obj_name}' from collection: {e}")
-            # Finally remove the object
             try:
                 bpy.data.objects.remove(ob, do_unlink=True)
+                deleted += 1
+                print(f"[NinjaFix] Deleted '{name}'")
             except Exception as e:
-                print(f"[DEBUG] Warning: failed to remove '{obj_name}': {e}")
-                continue
-            deleted += 1
-            # After removal, avoid accessing ob; use stored name
-            print(f"[NinjaFix] Deleted '{obj_name}'")
-            # Optionally clear ob reference
-            ob = None
+                print(f"[DEBUG] Warn: removal failed for '{name}': {e}")
         self.report({'INFO'}, f"Removed {deleted} duplicates.")
         print("================ NinjaFix DEBUG END ================\n")
         return {'FINISHED'}
