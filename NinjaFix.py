@@ -182,73 +182,83 @@ class NFIX_OT_RemoveMatDuplicates(Operator):
 
     def execute(self, context):
         """
-        Deletes meshes that are duplicates in GEOMETRY AND LOCATION (World Space).
-        This will NOT delete identical objects (like two lamps) that have been
-        placed in different locations in the scene. A duplicate is only an object
-        that is stacked on top of an identical one.
+        Deletes meshes that are duplicates in GEOMETRY AND LOCATION (World Space),
+        with extensive debugging to trace why meshes may not be deleted.
         """
         import numpy as np
-        from mathutils import Matrix
+        from mathutils import Matrix, kdtree
+        import re
+
         depsgraph = context.evaluated_depsgraph_get()
         scene = context.scene
+        tol = 0.005
 
-        # A very small tolerance for world-space comparison.
-        # Two objects are duplicates if their vertices match within this distance.
-        tol = 0.001 
-        print(f"\n[NinjaFix DEBUG] Starting world-space duplicate removal (tol = {tol:.4f})")
+        print("\n================ NinjaFix DEBUG START ================")
+        print(f"[DEBUG] Tolerance for duplicate detection: {tol}")
 
-        # 1) Collect all mesh objects with their WORLD-SPACE points arrays
-        mesh_entries = []  # each: {'obj': ob, 'pts': np.ndarray shape (N,3) in WORLD space}
-        for ob in scene.objects:
+        # 1) Collect world-space points for each mesh
+        mesh_entries = []
+        for ob in list(scene.objects):
             if ob.type != 'MESH':
                 continue
-
-            # Use the existing helper to get final, world-space vertex coordinates
-            pts_world = NFIX_AlignmentLogic.get_evaluated_world_points(ob, depsgraph)
-
-            if pts_world.shape[0] == 0:
-                print(f"[DEBUG] Skipping '{ob.name}': no vertices.")
+            pts = NFIX_AlignmentLogic.get_evaluated_world_points(ob, depsgraph)
+            # Debug: vertex count
+            name = ob.name  # store name for debug
+            print(f"[DEBUG] Object '{name}': vertex count = {pts.shape[0]}")
+            if pts.shape[0] == 0:
+                print(f"[DEBUG] Skipping '{name}' (no vertices)")
                 continue
-
-            mesh_entries.append({'obj': ob, 'pts': pts_world})
-            print(f"[DEBUG] Collected '{ob.name}' with {pts_world.shape[0]} world-space verts")
-
+            mesh_entries.append({'obj': ob, 'pts': pts})
         n = len(mesh_entries)
-        if n == 0:
-            self.report({'WARNING'}, "No valid mesh objects found.")
+        print(f"[DEBUG] Total meshes considered: {n}")
+        if n < 2:
+            self.report({'WARNING'}, "Not enough meshes to compare.")
+            print("================ NinjaFix DEBUG END ================\n")
             return {'CANCELLED'}
 
-        # 2) Build adjacency: for each pair i<j with same vertex count, directly compare world points
+        # 2) Build adjacency by KD-tree nearest-neighbor check
         adj = {i: set() for i in range(n)}
         for i in range(n):
             ob_i = mesh_entries[i]['obj']
             pts_i = mesh_entries[i]['pts']
-            cnt_i = pts_i.shape[0]
-
+            name_i = ob_i.name
             for j in range(i + 1, n):
                 ob_j = mesh_entries[j]['obj']
                 pts_j = mesh_entries[j]['pts']
-
-                # Must have same number of vertices to be a potential duplicate
-                if pts_j.shape[0] != cnt_i:
+                name_j = ob_j.name
+                print(f"\n[DEBUG] Comparing '{name_i}' vs '{name_j}'")
+                if pts_i.shape[0] != pts_j.shape[0]:
+                    print(f"[DEBUG] Vertex count mismatch ({pts_i.shape[0]} vs {pts_j.shape[0]}), skipping")
                     continue
 
-                # --- NEW SIMPLIFIED LOGIC ---
-                # No complex alignment. Just subtract the world positions and find the max error.
-                # If the max error is tiny, they are in the same location.
-                diffs = pts_i - pts_j
-                dists = np.linalg.norm(diffs, axis=1)
-                max_err = float(dists.max()) if dists.size else float('inf')
+                # build KD-tree on pts_j
+                size = pts_j.shape[0]
+                kd = kdtree.KDTree(size)
+                for idx, co in enumerate(pts_j):
+                    kd.insert(co, idx)
+                kd.balance()
+                print(f"[DEBUG] KD-tree built for '{name_j}' with {size} points")
 
-                print(f"[DEBUG] Comparing '{ob_i.name}' vs '{ob_j.name}': max world-space dist = {max_err:.6f}")
+                # compute max NN distance from pts_i to pts_j
+                max_err = 0.0
+                for idx_i, co in enumerate(pts_i):
+                    _, _, d = kd.find(co)
+                    if d > max_err:
+                        max_err = d
+                    if max_err >= tol:
+                        print(f"[DEBUG] Early exit at pts_i[{idx_i}] d={d:.6f} >= tol")
+                        break
+                print(f"[DEBUG] Max NN distance = {max_err:.6f}")
 
                 if max_err < tol:
-                    # They are geometrically identical AND in the same location. This is a duplicate.
                     adj[i].add(j)
                     adj[j].add(i)
-                    print(f"[DEBUG] Marking overlap: '{ob_i.name}' and '{ob_j.name}' are stacked duplicates.")
+                    print(f"[DEBUG] Marking as duplicates (within tol)")
+                else:
+                    print(f"[DEBUG] Not duplicates (exceeds tol)")
 
         # 3) Find clusters (connected components)
+        print("\n[DEBUG] Building clusters from adjacency")
         visited = set()
         clusters = []
         for i in range(n):
@@ -266,73 +276,103 @@ class NFIX_OT_RemoveMatDuplicates(Operator):
                     if v not in comp:
                         stack.append(v)
             clusters.append(comp)
+        print(f"[DEBUG] Found {len(clusters)} clusters:")
+        for ci, comp in enumerate(clusters):
+            names = [mesh_entries[k]['obj'].name for k in comp]
+            print(f"  Cluster {ci}: {names}")
 
-        # 4) For each cluster, choose keeper and mark others
+        # 4) Select keeper and mark others for deletion
         to_delete = []
-        import re
         hash_pat = re.compile(r"^mat_[A-F0-9]{6,}$", re.I)
-
-        def has_normal(ob):
-            if not ob.material_slots:
+        def has_normal(ob_local):
+            # Returns True if object has any material slot whose material name is not a mat_ hash,
+            # or if no material slots (assume 'normal')
+            if not ob_local.material_slots:
                 return True
-            for slot in ob.material_slots:
+            for slot in ob_local.material_slots:
                 mat = slot.material
-                if mat is None or not hash_pat.fullmatch(mat.name):
+                if mat is None:
+                    return True
+                if not hash_pat.fullmatch(mat.name):
                     return True
             return False
 
-        for comp in clusters:
-            if len(comp) <= 1:
-                continue  # Not a duplicate cluster
-
-            entries = [mesh_entries[idx] for idx in comp]
+        for ci, comp in enumerate(clusters):
+            if len(comp) < 2:
+                print(f"[DEBUG] Cluster {ci} has <2 members, skipping")
+                continue
+            entries = [mesh_entries[k] for k in comp]
             names = [e['obj'].name for e in entries]
-            print(f"[DEBUG] Overlap cluster: {names}")
+            print(f"\n[DEBUG] Processing Cluster {ci}: {names}")
 
-            # Keeper selection logic
+            # choose keeper
             keeper = None
             reason = ""
+            # 1) pure Ninja: name starts with "mesh_" and no dot
             for e in entries:
-                name = e['obj'].name
-                if name.startswith("mesh_") and "." not in name:
-                    keeper = e['obj']
-                    reason = "pure Ninja (no suffix)"
+                ob_e = e['obj']
+                name_e = ob_e.name
+                if name_e.startswith("mesh_") and "." not in name_e:
+                    keeper = ob_e
+                    reason = "pure Ninja"
                     break
+            # 2) has normal material
             if keeper is None:
                 for e in entries:
-                    if has_normal(e['obj']):
-                        keeper = e['obj']
+                    ob_e = e['obj']
+                    if has_normal(ob_e):
+                        keeper = ob_e
                         reason = "has normal material"
                         break
+            # 3) fallback: first in list
             if keeper is None:
                 keeper = entries[0]['obj']
                 reason = "first fallback"
+            print(f"[DEBUG] Keeper selected: '{keeper.name}' ({reason})")
 
-            print(f"[DEBUG] Keeper selected: '{keeper.name}' because {reason}")
+            # mark others
             for e in entries:
-                ob = e['obj']
-                if ob is not keeper:
-                    print(f"[DEBUG] Marking '{ob.name}' for deletion (duplicate of '{keeper.name}')")
-                    to_delete.append(ob)
+                ob_e = e['obj']
+                if ob_e is not keeper:
+                    print(f"[DEBUG] Marking '{ob_e.name}' for deletion")
+                    to_delete.append(ob_e)
 
-        # 5) Delete marked objects (applying all transforms before deletion)
+        # 5) Apply transforms & delete
         deleted = 0
+        print(f"\n[DEBUG] Deleting {len(to_delete)} objects:")
         for ob in to_delete:
-            name = ob.name
-            # Apply all transformations to the mesh before deleting
+            # Store needed properties before removal
+            obj_name = ob.name
+            # Debug print before removal
+            print(f"[DEBUG] Deleting '{obj_name}'")
+            # Bake matrix_world into mesh data to preserve transforms if needed
             if ob.type == 'MESH':
                 mat = ob.matrix_world.copy()
-                ob.data.transform(mat)
+                try:
+                    ob.data.transform(mat)
+                except Exception as e:
+                    # If transform fails, still proceed
+                    print(f"[DEBUG] Warning: failed to bake transform for '{obj_name}': {e}")
                 ob.matrix_world = Matrix.Identity(4)
-
-            # Unlink from all collections before removing data
+            # Unlink from collections
             for coll in list(ob.users_collection):
-                coll.objects.unlink(ob)
-            bpy.data.objects.remove(ob, do_unlink=True)
+                try:
+                    coll.objects.unlink(ob)
+                except Exception as e:
+                    print(f"[DEBUG] Warning: failed to unlink '{obj_name}' from collection: {e}")
+            # Finally remove the object
+            try:
+                bpy.data.objects.remove(ob, do_unlink=True)
+            except Exception as e:
+                print(f"[DEBUG] Warning: failed to remove '{obj_name}': {e}")
+                continue
             deleted += 1
-            print(f"[NinjaFix] Deleted '{name}'")
-
-        self.report({'INFO'}, f"Removed {deleted} stacked duplicate(s).")
+            # After removal, avoid accessing ob; use stored name
+            print(f"[NinjaFix] Deleted '{obj_name}'")
+            # Optionally clear ob reference
+            ob = None
+        self.report({'INFO'}, f"Removed {deleted} duplicates.")
+        print("================ NinjaFix DEBUG END ================\n")
         return {'FINISHED'}
 
 # =================================================================================================
