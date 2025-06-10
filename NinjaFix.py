@@ -183,11 +183,14 @@ class NFIX_OT_RemoveMatDuplicates(Operator):
     def execute(self, context):
         """
         Deletes meshes that are duplicates in GEOMETRY AND LOCATION (World Space),
-        with caching of evaluated points, KD-trees, and material-hash checks.
+        with caching of evaluated points and KD-trees, and never deleting any mesh
+        that has a “normal” material (i.e., any material whose name does NOT start with 'mat_').
+        If a cluster has both normal-material and mat_-only meshes, delete all mat_-only.
+        If cluster all mat_-only: pick one keeper (pure Ninja first, else first) and delete others.
+        If cluster all normal-material: delete none.
         """
         import numpy as np
         from mathutils import Matrix, kdtree
-        import re
 
         depsgraph = context.evaluated_depsgraph_get()
         scene = context.scene
@@ -197,27 +200,41 @@ class NFIX_OT_RemoveMatDuplicates(Operator):
         print(f"[DEBUG] Tolerance for duplicate detection: {tol}")
 
         # ---------------------------------------------------------------------
-        # 1) PRECOMPUTE & CACHE: world-space points, KD-trees, mat-hash flags
+        # 1) PRECOMPUTE & CACHE: world-space points, KD-trees, has_normal flag
         # ---------------------------------------------------------------------
         world_pts_cache = {}
         kd_cache        = {}
-        matflag_cache   = {}
         entries         = []
-        hash_pat        = re.compile(r"^mat_[A-F0-9]{6,}$", re.I)
+        matflag_cache   = {}
 
         def has_normal_mat(obj):
-            if obj.name in matflag_cache:
-                return matflag_cache[obj.name]
-            # determine if object has a "normal" material
+            """
+            Returns True if object has any material slot whose material name
+            does NOT start with 'mat_', or if it has no material slots or slot.material is None.
+            Returns False only if there is at least one material slot and every slot.material.name starts with 'mat_'.
+            """
+            name = obj.name
+            if name in matflag_cache:
+                return matflag_cache[name]
+            # If no material slots, treat as normal
+            if not obj.material_slots:
+                matflag_cache[name] = True
+                return True
+            # Check each slot
             for slot in obj.material_slots:
                 mat = slot.material
-                if mat is None or not hash_pat.fullmatch(mat.name):
-                    matflag_cache[obj.name] = True
+                if mat is None:
+                    matflag_cache[name] = True
                     return True
-            matflag_cache[obj.name] = not obj.material_slots
-            return matflag_cache[obj.name]
+                mname = mat.name
+                if not mname.lower().startswith("mat_"):
+                    matflag_cache[name] = True
+                    return True
+            # All slots have material names starting with 'mat_'
+            matflag_cache[name] = False
+            return False
 
-        # collect meshes
+        # collect meshes and build caches
         for ob in list(scene.objects):
             if ob.type != 'MESH':
                 continue
@@ -242,12 +259,18 @@ class NFIX_OT_RemoveMatDuplicates(Operator):
                 kd.balance()
                 kd_cache[ob.name] = kd
 
+            # determine has_normal and optionally print material info
+            has_norm = has_normal_mat(ob)
+            mat_names = [slot.material.name if slot.material else "None" for slot in ob.material_slots]
+            print(f"[DEBUG]   Materials on '{ob.name}': {mat_names}")
+            print(f"[DEBUG]   has_normal flag = {has_norm}")
+
             entries.append({
                 'obj': ob,
                 'pts': pts,
                 'vcount': vcount,
                 'kd': kd,
-                'has_normal': has_normal_mat(ob),
+                'has_normal': has_norm,
             })
 
         n = len(entries)
@@ -293,7 +316,7 @@ class NFIX_OT_RemoveMatDuplicates(Operator):
                     if max_err < tol:
                         adj[i].add(j)
                         adj[j].add(i)
-                        print(f"[DEBUG] Marking duplicates (tol={tol:.6f})")
+                        print(f"[DEBUG] Marking duplicates (within tol)")
 
         # ---------------------------------------------------------------------
         # 4) BUILD CLUSTERS
@@ -322,6 +345,10 @@ class NFIX_OT_RemoveMatDuplicates(Operator):
 
         # ---------------------------------------------------------------------
         # 5) SELECT KEEPERS & COLLECT FOR DELETION
+        #    - Never delete any mesh with has_normal=True.
+        #    - If cluster has both normal-material and mat_-only meshes: delete all mat_-only.
+        #    - If cluster all mat_-only: pick one keeper (pure Ninja first, else first) and delete others.
+        #    - If cluster all normal-material: delete none.
         # ---------------------------------------------------------------------
         to_delete = []
         for ci, comp in enumerate(clusters):
@@ -331,43 +358,53 @@ class NFIX_OT_RemoveMatDuplicates(Operator):
             names = [e['obj'].name for e in ents]
             print(f"\n[DEBUG] Processing Cluster {ci}: {names}")
 
-            keeper = None
-            reason = ""
-            # 1) pure Ninja mesh (name starts with mesh_ and no dot)
-            for e in ents:
-                nm = e['obj'].name
-                if nm.startswith("mesh_") and "." not in nm:
-                    keeper = e['obj']
-                    reason = "pure Ninja"
-                    break
-            # 2) has normal material
-            if keeper is None:
-                for e in ents:
-                    if e['has_normal']:
-                        keeper = e['obj']
-                        reason = "has normal material"
-                        break
-            # 3) fallback
-            if keeper is None:
-                keeper = ents[0]['obj']
-                reason = "first fallback"
-            print(f"[DEBUG] Keeper: '{keeper.name}' ({reason})")
+            normal_objs = [e for e in ents if e['has_normal']]
+            matonly_objs = [e for e in ents if not e['has_normal']]
 
-            for e in ents:
-                ob_e = e['obj']
-                if ob_e is not keeper:
-                    print(f"[DEBUG] Marking '{ob_e.name}' for deletion")
-                    to_delete.append(ob_e)
+            if normal_objs:
+                # Keep all normal-material meshes; delete all mat_-only meshes
+                print(f"[DEBUG] Cluster {ci} has {len(normal_objs)} normal-material meshes; preserving them.")
+                if matonly_objs:
+                    for e in matonly_objs:
+                        ob_e = e['obj']
+                        print(f"[DEBUG] Marking mat_-only '{ob_e.name}' for deletion")
+                        to_delete.append(ob_e)
+                else:
+                    print(f"[DEBUG] No mat_-only meshes in Cluster {ci}; nothing to delete.")
+            else:
+                # All are mat_-only: pick keeper among them
+                keeper = None
+                reason = ""
+                # 1) pure Ninja
+                for e in ents:
+                    nm = e['obj'].name
+                    if nm.startswith("mesh_") and "." not in nm:
+                        keeper = e['obj']
+                        reason = "pure Ninja"
+                        break
+                if keeper is None:
+                    keeper = ents[0]['obj']
+                    reason = "first fallback"
+                print(f"[DEBUG] Keeper among mat_-only Cluster {ci}: '{keeper.name}' ({reason})")
+                for e in ents:
+                    ob_e = e['obj']
+                    if ob_e is not keeper:
+                        print(f"[DEBUG] Marking mat_-only '{ob_e.name}' for deletion")
+                        to_delete.append(ob_e)
 
         # ---------------------------------------------------------------------
         # 6) BATCH DELETE SAFELY
         # ---------------------------------------------------------------------
         deleted = 0
         print(f"\n[DEBUG] Deleting {len(to_delete)} objects:")
-        # We do all unlinks in one pass before removes to avoid modifying scene.objects mid-loop
+        # First unlink all to avoid modifying scene.objects mid-loop
         for ob in to_delete:
             for coll in list(ob.users_collection):
-                coll.objects.unlink(ob)
+                try:
+                    coll.objects.unlink(ob)
+                except Exception as e:
+                    print(f"[DEBUG] Warning: failed to unlink '{ob.name}' from collection: {e}")
+        # Then remove
         for ob in to_delete:
             name = ob.name
             print(f"[DEBUG] Deleting '{name}'")
@@ -376,14 +413,14 @@ class NFIX_OT_RemoveMatDuplicates(Operator):
                 try:
                     ob.data.transform(mat)
                 except Exception as e:
-                    print(f"[DEBUG] Warn: bake failed for '{name}': {e}")
+                    print(f"[DEBUG] Warning: bake failed for '{name}': {e}")
                 ob.matrix_world = Matrix.Identity(4)
             try:
                 bpy.data.objects.remove(ob, do_unlink=True)
                 deleted += 1
                 print(f"[NinjaFix] Deleted '{name}'")
             except Exception as e:
-                print(f"[DEBUG] Warn: removal failed for '{name}': {e}")
+                print(f"[DEBUG] Warning: removal failed for '{name}': {e}")
         self.report({'INFO'}, f"Removed {deleted} duplicates.")
         print("================ NinjaFix DEBUG END ================\n")
         return {'FINISHED'}
