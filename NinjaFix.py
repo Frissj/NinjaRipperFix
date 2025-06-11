@@ -966,8 +966,13 @@ class VIEW3D_PT_NinjaFix_Aligner(Panel):
     bl_category = "NinjaFix"
 
     def draw(self, context):
+        import bpy, json
         layout = self.layout
         st = context.scene.ninjafix_settings
+
+        # Determine fallback for the "ROTATE" icon if not available
+        icon_items = bpy.types.UILayout.bl_rna.functions['operator'].parameters['icon'].enum_items.keys()
+        rotate_icon = 'ROTATE' if 'ROTATE' in icon_items else 'FILE_TICK'
 
         # Stage 1: Select Meshes
         if not NUMPY_INSTALLED:
@@ -987,7 +992,11 @@ class VIEW3D_PT_NinjaFix_Aligner(Panel):
         box = layout.box()
         box.label(text="Stage 2: Initial Alignment", icon='PLAY')
         box.enabled = bool(st.source_obj and st.target_obj)
-        box.operator('nfix.calculate_and_batch_fix', text="Generate & Apply Fix", icon='ROTATE')
+        box.operator(
+            'nfix.calculate_and_batch_fix',
+            text="Generate & Apply Fix",
+            icon=rotate_icon
+        )
 
         # Stage 3: Manage Captures
         box = layout.box()
@@ -1007,7 +1016,6 @@ class VIEW3D_PT_NinjaFix_Aligner(Panel):
                 rows=4
             )
             box.operator("nfix.import_selected_folders", icon='IMPORT')
-
 
         # Existing capture sets listing
         if not CAPTURE_SETS and "ninjafix_capture_sets" in context.scene:
