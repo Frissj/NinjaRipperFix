@@ -20,12 +20,17 @@ import os
 import numpy as np
 from bpy.props import CollectionProperty
 from bpy.types import OperatorFileListElement
+from collections import Counter
 
 # --- Globals ---
 CAPTURE_SETS = []
 INITIAL_ALIGN_MATRIX = None
 GOLDEN_TARGETS = {} # NEW: To store the 'snapshot' of target points
 PREFERRED_ANCHOR_HASHES = set()
+NON_UNIQUE_GEOM_HASHES = set()
+SEEN_GEOM_HASHES = set()
+TEXTURE_PIXEL_CACHE = {}
+_TEXTURE_HASH_CACHE = {}
 
 # --- Dependency Check ---
 try:
@@ -67,6 +72,77 @@ def get_db_path():
         return None
     return os.path.join(os.path.dirname(blend_path), ".ninjafix_db.json")
 
+def get_geometry_hash(obj):
+    """
+    Creates a SHA256 hash from an object's LOCAL vertex coordinates.
+    
+    FINAL VERSION: This version uses quantization to handle floating-point noise
+    AND canonical sorting to handle differences in vertex order. This provides
+    the most robust possible fingerprint for identifying identical base geometry.
+    """
+    if not obj or obj.type != 'MESH' or not obj.data.vertices:
+        return ""
+    
+    v_count = len(obj.data.vertices)
+    local_coords = np.empty(v_count * 3, dtype=np.float32)
+    obj.data.vertices.foreach_get("co", local_coords)
+    local_coords.shape = (v_count, 3)
+    
+    # 1. Quantize coordinates to remove floating-point noise.
+    quantization_factor = 10000.0
+    quantized_coords = np.round(local_coords * quantization_factor).astype(np.int64)
+    
+    # 2. Sort vertices in a canonical order (by X, then Y, then Z) to be
+    # immune to vertex order differences. We must use a structured array for this.
+    structured_array = np.core.records.fromarrays(quantized_coords.transpose(), names='x, y, z')
+    structured_array.sort(order=['x', 'y', 'z'], axis=0)
+
+    # 3. The hash is now based on the bytes of this stable, sorted, integer array.
+    return hashlib.sha256(structured_array.tobytes()).hexdigest()
+
+def calculate_shape_difference(pts1, pts2):
+    """
+    Calculates the Root Mean Square Deviation (RMSD) between two point clouds
+    after aligning them via rotation and translation. This is a measure of
+    pure shape difference. Returns a single float value.
+    """
+    v1 = pts1.shape[0]
+    v2 = pts2.shape[0]
+
+    if v1 != v2 or v1 < 3:
+        return -1.0 # Return -1 to indicate an error/mismatch
+
+    # Use float64 for precision in geometric calculations
+    pts1 = pts1.astype(np.float64)
+    pts2 = pts2.astype(np.float64)
+
+    # 1. Center both point clouds
+    centroid1 = np.mean(pts1, axis=0)
+    centroid2 = np.mean(pts2, axis=0)
+    pts1_centered = pts1 - centroid1
+    pts2_centered = pts2 - centroid2
+
+    # 2. Compute the cross-covariance matrix H
+    H = pts1_centered.T @ pts2_centered
+
+    # 3. Find the optimal rotation using Singular Value Decomposition (SVD)
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+
+    # Correct for reflection if necessary
+    if np.linalg.det(R) < 0:
+       Vt[2,:] *= -1
+       R = Vt.T @ U.T
+
+    # 4. Apply the optimal rotation
+    pts1_aligned = pts1_centered @ R
+
+    # 5. Calculate and return the final RMSD
+    diff = pts1_aligned - pts2_centered
+    rmsd = np.sqrt(np.mean(np.sum(diff**2, axis=1)))
+    
+    return rmsd
+
 def load_db():
     path = get_db_path()
     if not path or not os.path.exists(path):
@@ -86,6 +162,111 @@ def save_db(db):
             json.dump(db, f, indent=4)
     except Exception as e:
         print(f"Failed to save NinjaFix DB: {e}")
+
+def images_are_close(arr1, arr2, tol=1e-4):
+    """
+    Return True if two flattened pixel buffers differ by less than
+    tol * number_of_elements. Supports both numpy arrays and Python array.array.
+    """
+    import numpy as np
+
+    # Convert to numpy arrays if necessary
+    a1 = np.asarray(arr1, dtype=np.float32)
+    a2 = np.asarray(arr2, dtype=np.float32)
+
+    # Must have the same shape/length
+    if a1.shape != a2.shape:
+        return False
+
+    # Euclidean norm of the difference
+    diff = np.linalg.norm(a1 - a2)
+
+    # Compare to tol * total number of floats
+    return diff < tol * a1.size
+
+
+def get_individual_texture_hashes(obj):
+    """
+    Finds all ImageTexture nodes driving Base Color on used slots,
+    reads their full pixel buffers once, and returns their MD5 hashes.
+    """
+    hashes = set()
+    try:
+        used_idxs = {p.material_index for p in obj.data.polygons}
+    except Exception:
+        used_idxs = set()
+
+    for idx, slot in enumerate(obj.material_slots):
+        if idx not in used_idxs or not slot.material or not slot.material.use_nodes:
+            continue
+
+        output_node = next(
+            (n for n in slot.material.node_tree.nodes
+             if n.type == 'OUTPUT_MATERIAL' and n.is_active_output),
+            None
+        )
+        if not output_node or not output_node.inputs['Surface'].is_linked:
+            continue
+
+        bsdf = output_node.inputs['Surface'].links[0].from_node
+        if bsdf.type != 'BSDF_PRINCIPLED':
+            continue
+
+        base_in = bsdf.inputs.get('Base Color')
+        if not base_in or not base_in.is_linked:
+            continue
+
+        def find_tex_node(node, visited):
+            if node in visited:
+                return None
+            visited.add(node)
+            if node.type == 'TEX_IMAGE':
+                return node
+            for inp in node.inputs:
+                if inp.is_linked:
+                    found = find_tex_node(inp.links[0].from_node, visited)
+                    if found:
+                        return found
+            return None
+
+        tex_node = find_tex_node(base_in.links[0].from_node, set())
+        if not tex_node or not getattr(tex_node, 'image', None):
+            continue
+
+        img = tex_node.image
+        hashes.add(hash_image_pixels(img))
+
+    return hashes
+
+def hash_image_pixels(img):
+    """
+    Read img.pixels in one go via foreach_get into a Python array,
+    MD5 the raw bytes, and cache both the hash and the raw buffer
+    for later fuzzy matching.
+    """
+    import array
+    global TEXTURE_PIXEL_CACHE
+
+    name = img.name
+    if name in _TEXTURE_HASH_CACHE:
+        return _TEXTURE_HASH_CACHE[name]
+
+    # compute buffer size (RGBA)
+    w, h = img.size
+    total = w * h * 4
+
+    # bulk-copy into a Python float array
+    buf = array.array('f', [0.0]) * total
+    img.pixels.foreach_get(buf)
+
+    # hash the raw bytes
+    hsh = hashlib.md5(buf.tobytes()).hexdigest()
+
+    # cache both hash and buffer for fuzzy matching
+    _TEXTURE_HASH_CACHE[name] = hsh
+    TEXTURE_PIXEL_CACHE[hsh] = buf
+
+    return hsh
 
 # --- Forward declaration for PropertyGroup update function ---
 def toggle_auto_capture_timer(self, context):
@@ -113,19 +294,16 @@ class NFIX_AlignmentLogic:
         
         try:
             eval_obj = obj.evaluated_get(depsgraph)
-            # Using .to_mesh() is sufficient and safer inside a try-finally block.
             temp_mesh = eval_obj.to_mesh()
             
             if not temp_mesh.vertices:
                 return np.array([])
 
-            # Get points and transform to world space
             size = len(temp_mesh.vertices)
             points = np.empty(size * 3, dtype=np.float32)
             temp_mesh.vertices.foreach_get("co", points)
             points.shape = (size, 3)
             
-            # Apply world matrix transformation
             matrix = np.array(eval_obj.matrix_world)
             points_h = np.hstack([points, np.ones((size, 1))])
             world_points = (points_h @ matrix.T)[:, :3]
@@ -134,7 +312,6 @@ class NFIX_AlignmentLogic:
 
         finally:
             if 'temp_mesh' in locals() and temp_mesh:
-                # This ensures the temp mesh is always freed.
                 eval_obj.to_mesh_clear()
 
     @staticmethod
@@ -157,8 +334,6 @@ class NFIX_AlignmentLogic:
 
         # 3. Create the 4x4 Blender matrix
         M = Matrix.Identity(4)
-    
-        # 4. Transpose and assign the result to the Blender matrix using loops
         M_T_transposed = M_T.T
         for r in range(3):
             for c in range(4):
@@ -168,20 +343,248 @@ class NFIX_AlignmentLogic:
 
     @staticmethod
     def get_texture_hash(obj):
-        if not obj: return ""
-        paths = set()
-        for slot in obj.material_slots:
-            mat = slot.material
-            if not mat or not mat.use_nodes: continue
-            for node in mat.node_tree.nodes:
-                if node.type == 'TEX_IMAGE' and getattr(node, 'image', None):
-                    paths.add(bpy.path.abspath(node.image.filepath))
-        m = hashlib.md5()
-        for p in sorted(list(paths)):
-            try:
-                with open(p, 'rb') as f: m.update(f.read())
-            except Exception: m.update(p.encode('utf-8'))
-        return m.hexdigest()
+        """
+        Grab the first Base-Color image on any used material slot,
+        hash its pixels (using our cached, bulk-foreach_get helper),
+        and return that MD5. Fast and cached.
+        """
+        try:
+            used_idxs = {p.material_index for p in obj.data.polygons}
+        except Exception:
+            used_idxs = set()
+
+        for idx, slot in enumerate(obj.material_slots):
+            if idx not in used_idxs or not slot.material or not slot.material.use_nodes:
+                continue
+
+            output_node = next(
+                (n for n in slot.material.node_tree.nodes
+                 if n.type == 'OUTPUT_MATERIAL' and n.is_active_output),
+                None
+            )
+            if not output_node or not output_node.inputs['Surface'].is_linked:
+                continue
+
+            bsdf = output_node.inputs['Surface'].links[0].from_node
+            if bsdf.type != 'BSDF_PRINCIPLED':
+                continue
+
+            base_in = bsdf.inputs.get('Base Color')
+            if not base_in or not base_in.is_linked:
+                continue
+
+            def find_tex_node(node, visited):
+                if node in visited:
+                    return None
+                visited.add(node)
+                if node.type == 'TEX_IMAGE':
+                    return node
+                for inp in node.inputs:
+                    if inp.is_linked:
+                        found = find_tex_node(inp.links[0].from_node, visited)
+                        if found:
+                            return found
+                return None
+
+            tex_node = find_tex_node(base_in.links[0].from_node, set())
+            if not tex_node or not getattr(tex_node, 'image', None):
+                continue
+
+            # Use our fast, cached pixel-hash helper:
+            return hash_image_pixels(tex_node.image)
+
+        return ""
+
+class NFIX_OT_DebugShapeCompare(Operator):
+    """
+    The primary diagnostic tool.
+    - 1 mesh: Full Anchor Candidate Report.
+    - 2 meshes: Precise shape difference (RMSD) analysis.
+    - 4 meshes (2 Ninja, 2 Remix): Full anchor pair validation, including fuzzy-texture matching.
+    """
+    bl_idname = "nfix.debug_shape_compare"
+    bl_label = "Generate Anchor Report"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            len(context.selected_objects) in (1, 2, 4)
+            and all(o.type == 'MESH' for o in context.selected_objects)
+        )
+
+    def execute(self, context):
+        import numpy as np
+        from mathutils import Matrix
+        import os
+
+        selected = context.selected_objects
+        depsgraph = context.evaluated_depsgraph_get()
+
+        # --- 1 object: Anchor Candidate Report ---
+        if len(selected) == 1:
+            obj = selected[0]
+            report_lines = [
+                "\n" + "="*50,
+                " NINJAFIX ANCHOR CANDIDATE REPORT",
+                "="*50,
+                f"Analyzing Candidate: {obj.name}\n"
+            ]
+
+            report_lines.append("--- 1. Uniqueness ---")
+            if not NON_UNIQUE_GEOM_HASHES:
+                print("ERROR: Run Stage 2 to build uniqueness database first.")
+                return {'CANCELLED'}
+            gh = get_geometry_hash(obj)
+            unique = gh not in NON_UNIQUE_GEOM_HASHES
+            report_lines.append(f"Result: {'UNIQUE' if unique else 'NON-UNIQUE'}")
+            report_lines.append(f"Verdict: {'PASSED.' if unique else 'INVALID ANCHOR.'}")
+            report_lines.append("")
+
+            report_lines.append("--- 2. Golden Counterpart ---")
+            th = NFIX_AlignmentLogic.get_texture_hash(obj)
+            has_gold = th in GOLDEN_TARGETS
+            report_lines.append(f"Result: {'Found' if has_gold else 'NOT Found'}")
+            report_lines.append(f"Verdict: {'PASSED.' if has_gold else 'INVALID ANCHOR.'}")
+            report_lines.append("")
+
+            final = "POOR"
+            if unique and has_gold:
+                report_lines.append("--- 3. Shape Quality ---")
+                pts = NFIX_AlignmentLogic.get_evaluated_world_points(obj, depsgraph)
+                best = float('inf')
+                for tgt in GOLDEN_TARGETS[th]:
+                    if pts.shape == tgt.shape:
+                        best = min(best, calculate_shape_difference(pts, tgt))
+                report_lines.append(f"Best RMSD: {best:.8f}")
+                if best < 0.01:
+                    report_lines.append("Verdict: PASSED. Shape difference below tolerance.")
+                    final = "GOOD"
+                else:
+                    report_lines.append("Verdict: FAILED. Shape difference too high.")
+            summary = f"This is a {final} anchor candidate."
+            report_lines += ["\n" + "="*50, f"  FINAL VERDICT: {summary}", "="*50]
+            for line in report_lines:
+                print(line)
+            self.report({'INFO'}, f"Report Generated. Final Verdict: {summary}")
+            return {'FINISHED'}
+
+        # --- 2 objects: Precise Shape Comparison ---
+        elif len(selected) == 2:
+            a, b = selected
+            if is_ninja(a) and is_remix(b):
+                ninja_obj, remix_obj = a, b
+            elif is_ninja(b) and is_remix(a):
+                ninja_obj, remix_obj = b, a
+            else:
+                print("ERROR: Must select one Ninja and one Remix mesh.")
+                return {'CANCELLED'}
+
+            pts_n = NFIX_AlignmentLogic.get_evaluated_world_points(ninja_obj, depsgraph)
+            pts_r = NFIX_AlignmentLogic.get_evaluated_world_points(remix_obj, depsgraph)
+            if pts_n.shape[0] < 3 or pts_r.shape[0] < 3 or pts_n.shape[0] != pts_r.shape[0]:
+                print("ERROR: Need ≥3 verts and equal counts.")
+                return {'CANCELLED'}
+
+            M = NFIX_AlignmentLogic.solve_alignment(pts_n, pts_r)
+            ones = np.ones((pts_n.shape[0],1))
+            aligned = (np.hstack([pts_n.astype(np.float64), ones]) @ np.array(M).T)[:,:3]
+            rmsd = float(np.sqrt(np.mean(np.sum((aligned - pts_r)**2, axis=1))))
+            print("\n" + "="*50)
+            print(" NINJAFIX FINAL SHAPE ANALYSIS")
+            print("="*50)
+            print(f"Ninja mesh: {ninja_obj.name}")
+            print(f"Remix mesh: {remix_obj.name}\n")
+            print(f"Affine-Aligned RMSD: {rmsd:.8f}\n")
+            conclusion = "IDENTICAL" if rmsd < 1e-6 else f"DIFFERENT (RMSD: {rmsd:.6f})"
+            print(f"Conclusion: {conclusion}")
+            print("="*50)
+            self.report({'INFO'}, f"Analysis Complete. Summary: {conclusion}")
+            return {'FINISHED'}
+
+        # --- 4 objects: Texture-Pairing + Fuzzy Match + Shape Validate ---
+        elif len(selected) == 4:
+            ninjas = [o for o in selected if is_ninja(o)]
+            remixes = [o for o in selected if is_remix(o)]
+            if len(ninjas)!=2 or len(remixes)!=2:
+                print("ERROR: Must select exactly 2 Ninja and 2 Remix meshes.")
+                return {'CANCELLED'}
+
+            print("\n" + "="*60)
+            print(" NINJAFIX INDIVIDUAL TEXTURE HASH ANALYSIS")
+            print("="*60)
+            ninja_hashes = [get_individual_texture_hashes(n) for n in ninjas]
+            remix_hashes = [get_individual_texture_hashes(r) for r in remixes]
+            for i,n in enumerate(ninjas):
+                print(f"\nObject: '{n.name}' (Ninja) → {ninja_hashes[i]}")
+            for i,r in enumerate(remixes):
+                print(f"\nObject: '{r.name}' (Remix) → {remix_hashes[i]}")
+            print("\n" + "="*60)
+
+            pairs = []
+            used_n = set()
+            used_r = set()
+            for ri, rhset in enumerate(remix_hashes):
+                for ni, nhset in enumerate(ninja_hashes):
+                    if ni in used_n: continue
+                    common = rhset & nhset
+                    # fuzzy fallback
+                    if not common:
+                        for rh in rhset:
+                            for nh in nhset:
+                                arr_r = TEXTURE_PIXEL_CACHE.get(rh)
+                                arr_n = TEXTURE_PIXEL_CACHE.get(nh)
+                                if arr_r is not None and arr_n is not None and images_are_close(arr_r, arr_n):
+                                    common = {rh}
+                                    print(f"[FUZZY] Treating remix-hash {rh} ≈ ninja-hash {nh}")
+                                    break
+                            if common:
+                                break
+                    if common:
+                        pairs.append((ninjas[ni], remixes[ri]))
+                        used_n.add(ni)
+                        used_r.add(ri)
+                        break
+
+            if len(pairs)!=2:
+                print("ERROR: Could not form two texture-pairs.")
+                return {'CANCELLED'}
+
+            print("SUCCESS: Formed pairs:", [(n.name, r.name) for n,r in pairs])
+
+            # shape-check each
+            results = []
+            tol = 0.07
+            for idx,(n,r) in enumerate(pairs):
+                pts1 = NFIX_AlignmentLogic.get_evaluated_world_points(n, depsgraph)
+                pts2 = NFIX_AlignmentLogic.get_evaluated_world_points(r, depsgraph)
+                if pts1.shape!=pts2.shape or pts1.shape[0]<4:
+                    results.append((idx, None, "Vertex Mismatch"))
+                    continue
+                M = NFIX_AlignmentLogic.solve_alignment(pts1, pts2)
+                aligned = (np.hstack([pts1, np.ones((pts1.shape[0],1))]) @ np.array(M).T)[:,:3]
+                rmsd = float(np.sqrt(np.mean(np.sum((aligned-pts2)**2, axis=1))))
+                verdict = "PASSED" if rmsd<tol else f"FAILED (RMSD {rmsd:.6f})"
+                results.append((idx, rmsd, verdict))
+
+            # consensus
+            final_ok = all(r[2]=="PASSED" for r in results)
+            print("\n" + "="*60)
+            print(" NINJAFIX ANCHOR PAIR VALIDATION REPORT")
+            print("="*60)
+            for i,(rmsd,verdict) in enumerate([(r[1],r[2]) for r in results]):
+                n,r = pairs[i]
+                print(f"Pair {i+1}: '{n.name}'→'{r.name}' | RMSD: {rmsd:.8f} → {verdict}")
+            if final_ok:
+                print("FINAL VERDICT: VALID ANCHOR PAIR")
+            else:
+                print("FINAL VERDICT: INVALID ANCHOR PAIR")
+            print("="*60)
+
+            self.report({'INFO'}, "Validation Complete. See System Console for full report.")
+            return {'FINISHED'}
+
+        return {'CANCELLED'}
 
 class NFIX_OT_RemoveMatDuplicates(Operator):
     bl_idname = "nfix.remove_mat_duplicates"
@@ -550,11 +953,12 @@ class NFIX_OT_CalculateAndBatchFix(Operator):
         return NUMPY_INSTALLED and st.source_obj and st.target_obj
 
     def execute(self, context):
-        global INITIAL_ALIGN_MATRIX, GOLDEN_TARGETS, PREFERRED_ANCHOR_HASHES
+        global INITIAL_ALIGN_MATRIX, GOLDEN_TARGETS, PREFERRED_ANCHOR_HASHES, SEEN_GEOM_HASHES
 
         st = context.scene.ninjafix_settings
         depsgraph = context.evaluated_depsgraph_get()
 
+        # 1) Compute our alignment matrix
         src_pts = NFIX_AlignmentLogic.get_evaluated_world_points(st.source_obj, depsgraph)
         tgt_pts = NFIX_AlignmentLogic.get_evaluated_world_points(st.target_obj, depsgraph)
 
@@ -562,49 +966,57 @@ class NFIX_OT_CalculateAndBatchFix(Operator):
             self.report({'ERROR'}, "Meshes must be valid and have identical vertex counts.")
             return {'CANCELLED'}
 
-        # --- compute initial alignment matrix ---
         M0 = NFIX_AlignmentLogic.solve_alignment(src_pts, tgt_pts)
         INITIAL_ALIGN_MATRIX = M0.copy()
 
-        # --- extract non-uniform scale and save FULL matrix + scale to DB ---
-        loc, rot, scale = M0.decompose()
-        db = load_db()
+        # 2) Persist it immediately to disk
         blend_file = bpy.data.filepath
-        db[blend_file] = {
-            "scale": [scale.x, scale.y, scale.z],
-            "matrix": mat_to_list(M0)
-        }
-        save_db(db)
-        self.report({'INFO'}, f"Saved full alignment matrix and scale to DB for {blend_file}")
+        if blend_file:
+            db = load_db()
+            loc, rot, scale = M0.decompose()
+            db[blend_file] = {
+                "scale":  [scale.x, scale.y, scale.z],
+                "matrix": mat_to_list(M0)
+            }
+            save_db(db)  # ← Auto-save your stage-2 result on disk
 
-        # NEW: Add the initial anchor's hash to the preferred set
-        initial_anchor_hash = NFIX_AlignmentLogic.get_texture_hash(st.source_obj)
-        if initial_anchor_hash:
-            PREFERRED_ANCHOR_HASHES.add(initial_anchor_hash)
+        # 3) Mark our preferred anchor
+        PREFERRED_ANCHOR_HASHES.add(
+            NFIX_AlignmentLogic.get_texture_hash(st.source_obj)
+        )
 
-        # --- apply M0 to your first capture ---
+        # 4) Apply the transform in-place to all current Ninja meshes
         first_set = current_ninja_set(context.scene)
         for name in first_set:
             ob = context.scene.objects.get(name)
             if is_ninja(ob):
-                ob["ninjafix_prev_matrix"] = mat_to_list(ob.matrix_world)
+                if "ninjafix_prev_matrix" not in ob:
+                    ob["ninjafix_prev_matrix"] = mat_to_list(ob.matrix_world)
                 ob.matrix_world = M0 @ ob.matrix_world
 
-        # --- cache golden targets (unchanged) ---
-        self.report({'INFO'}, "Caching golden target data...")
+        # 5) Rebuild dynamic “golden” database from both the Remix and this first capture
         GOLDEN_TARGETS.clear()
+        SEEN_GEOM_HASHES.clear()
         depsgraph.update()
 
+        # collect all targets
         remix_objs = [o for o in context.scene.objects if is_remix(o)]
-        cap1_objs = [context.scene.objects.get(n) for n in first_set if context.scene.objects.get(n)]
-        for t_obj in remix_objs + cap1_objs:
-            if not t_obj or t_obj.type != 'MESH':
+        cap1_objs  = [context.scene.objects.get(n) for n in first_set]
+        for obj in remix_objs + cap1_objs:
+            if not obj or obj.type != 'MESH':
                 continue
-            t_hash = NFIX_AlignmentLogic.get_texture_hash(t_obj)
-            t_pts = NFIX_AlignmentLogic.get_evaluated_world_points(t_obj, depsgraph)
-            if t_pts.shape[0] > 0:
-                GOLDEN_TARGETS.setdefault(t_hash, []).append(t_pts)
+            tex_hash = NFIX_AlignmentLogic.get_texture_hash(obj)
+            pts = NFIX_AlignmentLogic.get_evaluated_world_points(obj, depsgraph)
+            if pts.shape[0] > 0:
+                GOLDEN_TARGETS.setdefault(tex_hash, []).append(pts)
 
+            geom_hash = get_geometry_hash(obj)
+            if geom_hash:
+                SEEN_GEOM_HASHES.add(geom_hash)
+
+        print(f"Database initialized with {len(SEEN_GEOM_HASHES)} unique shapes.")
+
+        # 6) Register the first capture if it wasn’t already
         if not any(c['name'] == "Capture 1" for c in CAPTURE_SETS):
             CAPTURE_SETS.insert(0, {
                 'name': "Capture 1",
@@ -612,11 +1024,15 @@ class NFIX_OT_CalculateAndBatchFix(Operator):
                 'reference_mesh': st.source_obj.name
             })
             context.scene["ninjafix_capture_sets"] = json.dumps([
-                {'name': c['name'], 'objects': list(c['objects']), 'reference_mesh': c.get('reference_mesh','')}
+                {
+                    'name': c['name'],
+                    'objects': list(c['objects']),
+                    'reference_mesh': c.get('reference_mesh','')
+                }
                 for c in CAPTURE_SETS
             ])
 
-        self.report({'INFO'}, "Initial alignment applied and target snapshot created.")
+        self.report({'INFO'}, "Initial alignment applied, and DB auto-saved.")
         return {'FINISHED'}
 
 class NFIX_OT_ForceCapture1(Operator):
@@ -658,119 +1074,301 @@ class NFIX_OT_ForceCapture1(Operator):
 # STAGE 4: PROCESS ALL OTHER CAPTURES
 # =================================================================================================
 class NFIX_OT_ProcessAllCaptures(Operator):
-    bl_idname      = "nfix.process_all_captures"
-    bl_label       = "Process All Captures"
-    bl_options     = {'REGISTER', 'UNDO'}
+    bl_idname = "nfix.process_all_captures"
+    bl_label = "Process All Captures"
+    bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
         return NUMPY_INSTALLED and len(CAPTURE_SETS) > 1 and bool(GOLDEN_TARGETS)
 
     def execute(self, context):
-        global INITIAL_ALIGN_MATRIX, GOLDEN_TARGETS, PREFERRED_ANCHOR_HASHES
+        global INITIAL_ALIGN_MATRIX, GOLDEN_TARGETS, PREFERRED_ANCHOR_HASHES, SEEN_GEOM_HASHES, TEXTURE_PIXEL_CACHE
+
+        import numpy as np
+        from mathutils import Matrix
+        from collections import Counter, defaultdict
 
         if not GOLDEN_TARGETS:
             self.report({'ERROR'}, "No cached target data found. Run Stage 2 first.")
             return {'CANCELLED'}
 
+        # 1) Pre-cache every golden texture's pixel buffer
+        for gh in list(GOLDEN_TARGETS.keys()):
+            if gh not in TEXTURE_PIXEL_CACHE:
+                for ob in context.scene.objects:
+                    if ob.type == 'MESH':
+                        hashes = get_individual_texture_hashes(ob)
+                        if gh in hashes:
+                            break
+
+        # 2) Build a list of (golden_hash, pixel_array, target_point_lists) for fast fuzzy
+        golden_entries = [
+            (gh, TEXTURE_PIXEL_CACHE[gh], GOLDEN_TARGETS[gh])
+            for gh in GOLDEN_TARGETS
+            if gh in TEXTURE_PIXEL_CACHE
+        ]
+
         depsgraph = context.evaluated_depsgraph_get()
-        tol = 0.05  # max allowed vertex distance
+        matrix_tol = 0.01
+        shape_match_tol = 0.07
         aligned_count = 0
-        skipped = 0
+        skipped_count = 0
+        successful_anchors = []
 
+        # 3) Compute 10% of scene diagonal once
+        scene_pts = []
+        for capx in CAPTURE_SETS[1:]:
+            for nm in capx['objects']:
+                ob = context.scene.objects.get(nm)
+                if ob and ob.type == 'MESH':
+                    pts = NFIX_AlignmentLogic.get_evaluated_world_points(ob, depsgraph)
+                    if pts.size:
+                        scene_pts.append(pts)
+        if scene_pts:
+            all_pts = np.vstack(scene_pts)
+            bb_min, bb_max = all_pts.min(axis=0), all_pts.max(axis=0)
+            min_anchor_dist = np.linalg.norm(bb_max - bb_min) * 0.10
+        else:
+            min_anchor_dist = 0.0
+
+        # 4) Process each capture
         for cap in CAPTURE_SETS[1:]:
-            # Get all ninja objects for the current capture
-            all_ninjas_in_cap = [
-                context.scene.objects.get(n)
-                for n in cap['objects']
-                if is_ninja(context.scene.objects.get(n))
+            if cap.get('reference_mesh'):
+                print(f"Skipping capture '{cap['name']}' (already processed)")
+                continue
+
+            cap['reference_mesh'] = ''
+            cap['validation_mesh'] = ''
+            print(f"\n{'='*25} PROCESSING CAPTURE: {cap['name']} {'='*25}")
+
+            failure_reasons = defaultdict(set)
+            consensus_failures = []
+
+            # 4.a) Gather all Ninja objects and caches
+            all_ninja_objs = [
+                context.scene.objects.get(nm)
+                for nm in cap['objects']
+                if is_ninja(context.scene.objects.get(nm))
             ]
+            pts_cache = {
+                o.name: NFIX_AlignmentLogic.get_evaluated_world_points(o, depsgraph)
+                for o in all_ninja_objs if o
+            }
+            geom_cache = {
+                o.name: get_geometry_hash(o)
+                for o in all_ninja_objs if o
+            }
+            tex_hash_cache = {
+                o.name: NFIX_AlignmentLogic.get_texture_hash(o)
+                for o in all_ninja_objs if o
+            }
+            pixel_cache = {
+                name: TEXTURE_PIXEL_CACHE.get(tex_hash_cache[name])
+                for name in tex_hash_cache
+            }
 
-            # NEW: Prioritize ninjas based on PREFERRED_ANCHOR_HASHES
-            preferred_ninjas = []
-            other_ninjas = []
-            for o in all_ninjas_in_cap:
-                if o is None: continue
-                h = NFIX_AlignmentLogic.get_texture_hash(o)
-                # Check if hash is valid and in the preferred set
-                if h and h in PREFERRED_ANCHOR_HASHES:
-                    preferred_ninjas.append(o)
-                else:
-                    other_ninjas.append(o)
-            
-            # Sort the remaining ninjas by vertex count as a fallback
-            other_ninjas.sort(key=lambda o: len(o.data.vertices) if o else 0, reverse=True)
+            # 4.b) Build geometry histogram across other captures
+            hist = Counter()
+            for other in (c for c in CAPTURE_SETS if c is not cap):
+                for nm in other['objects']:
+                    ob = context.scene.objects.get(nm)
+                    if ob and ob.type == 'MESH':
+                        h = get_geometry_hash(ob)
+                        if h:
+                            hist[h] += 1
 
-            # The final list to iterate over, with preferred anchors first
-            ninjas_to_try = preferred_ninjas + other_ninjas
-            
-            matched = False
-            for src in ninjas_to_try:
-                if src is None: continue
-                
-                pts = NFIX_AlignmentLogic.get_evaluated_world_points(src, depsgraph)
-                if pts.shape[0] == 0:
+            # 4.c) Determine candidate order
+            preferred = [
+                name for name in tex_hash_cache
+                if tex_hash_cache[name] in PREFERRED_ANCHOR_HASHES
+            ]
+            others = [
+                name for name in tex_hash_cache
+                if name not in preferred
+            ]
+            others.sort(
+                key=lambda n: pts_cache.get(n, np.array([])).shape[0],
+                reverse=True
+            )
+            candidates = preferred + others
+
+            final_matrix = None
+
+            # 4.d) Try each primary candidate
+            for primary_name in candidates:
+                if final_matrix:
+                    break
+
+                # Check uniqueness and vertex count
+                geom_h1 = geom_cache.get(primary_name)
+                if not geom_h1 or hist[geom_h1] > 1:
+                    failure_reasons["Primary: Not Unique"].add(primary_name)
+                    continue
+                pts1 = pts_cache.get(primary_name)
+                if pts1 is None or pts1.shape[0] < 4:
+                    failure_reasons["Primary: Too Few Verts"].add(primary_name)
                     continue
 
-                # skip perfectly symmetric shapes (two eigenvalues within 1%)
-                cov = np.cov(pts.T)
-                eig = np.linalg.eigvalsh(cov)
-                eig.sort()
-                if (eig[1] - eig[0]) / eig[2] < 0.01 or (eig[2] - eig[1]) / eig[2] < 0.01:
+                # Fuzzy-aware golden lookup for primary
+                phash = tex_hash_cache[primary_name]
+                arr_p = pixel_cache.get(primary_name)
+                match_primary = None
+                if phash in GOLDEN_TARGETS:
+                    match_primary = phash
+                elif arr_p is not None:
+                    for gh, arr_g, tgt_list in golden_entries:
+                        if images_are_close(arr_p, arr_g):
+                            match_primary = gh
+                            print(f"[FUZZY] Treating primary-hash {phash} ≈ golden-hash {gh} for '{primary_name}'")
+                            break
+                if not match_primary:
+                    failure_reasons["Primary: No Golden Counterpart"].add(primary_name)
                     continue
 
-                src_hash = NFIX_AlignmentLogic.get_texture_hash(src)
-                if src_hash not in GOLDEN_TARGETS:
-                    continue
+                centroid1 = np.mean(pts1, axis=0)
 
-                # test each cached target
-                for tgt_pts in GOLDEN_TARGETS[src_hash]:
-                    if pts.shape != tgt_pts.shape:
+                # 4.e) Build secondary list
+                secondaries = []
+                for secondary_name in candidates:
+                    if secondary_name == primary_name:
+                        continue
+                    geom_h2 = geom_cache.get(secondary_name)
+                    if not geom_h2 or hist[geom_h2] > 1:
+                        continue
+                    shash = tex_hash_cache[secondary_name]
+                    if shash == phash:
+                        continue
+                    secondaries.append(secondary_name)
+                secondaries.sort(
+                    key=lambda n: np.linalg.norm(np.mean(pts_cache.get(n, np.array([])), axis=0) - centroid1),
+                    reverse=True
+                )
+
+                # 4.f) Try each secondary
+                for secondary_name in secondaries:
+                    if final_matrix:
+                        break
+
+                    pts2 = pts_cache.get(secondary_name)
+                    if pts2 is None or pts2.shape[0] < 4:
+                        failure_reasons["Secondary: Too Few Verts"].add(secondary_name)
                         continue
 
-                    Mtest = NFIX_AlignmentLogic.solve_alignment(pts, tgt_pts)
-                    pts_h = np.hstack([pts, np.ones((pts.shape[0], 1))])
-                    aligned = (pts_h @ np.array(Mtest).T)[:, :3]
+                    # Fuzzy-aware golden lookup for secondary
+                    shash = tex_hash_cache[secondary_name]
+                    arr_s = pixel_cache.get(secondary_name)
+                    match_secondary = None
+                    if shash in GOLDEN_TARGETS:
+                        match_secondary = shash
+                    elif arr_s is not None:
+                        for gh, arr_g, tgt_list in golden_entries:
+                            if images_are_close(arr_s, arr_g):
+                                match_secondary = gh
+                                print(f"[FUZZY] Treating secondary-hash {shash} ≈ golden-hash {gh} for '{secondary_name}'")
+                                break
+                    if not match_secondary:
+                        failure_reasons["Secondary: No Golden Counterpart"].add(secondary_name)
+                        continue
 
-                    # max per-vertex error
-                    dists = np.linalg.norm(aligned - tgt_pts, axis=1)
-                    if dists.max() < tol:
-                        # Successful alignment, apply the transform to all objects in the capture
-                        for nm in cap['objects']:
-                            ob = context.scene.objects.get(nm)
-                            if is_ninja(ob):
-                                if "ninjafix_prev_matrix" not in ob:
-                                    ob["ninjafix_prev_matrix"] = mat_to_list(ob.matrix_world)
-                                
-                                ob.matrix_world = Mtest @ ob.matrix_world
-                        
-                        # NEW: Add the successful anchor hash to the preferred set for next captures
-                        successful_hash = NFIX_AlignmentLogic.get_texture_hash(src)
-                        if successful_hash:
-                            PREFERRED_ANCHOR_HASHES.add(successful_hash)
+                    centroid2 = np.mean(pts2, axis=0)
+                    if np.linalg.norm(centroid2 - centroid1) < min_anchor_dist:
+                        failure_reasons["Secondary: Too Close to Primary"].add(secondary_name)
+                        continue
 
-                        cap['reference_mesh'] = src.name
-                        self.report({'INFO'},
-                            f"'{cap['name']}': aligned via '{src.name}' (max-dist={dists.max():.4f})")
-                        aligned_count += 1
-                        matched = True
-                        break # Exit the inner loop (tgt_pts)
-                
-                if matched:
-                    break # Exit the outer loop (src)
+                    # 4.g) Compute alignments
+                    M1 = None
+                    for tgt_pts1 in GOLDEN_TARGETS[match_primary]:
+                        if pts1.shape != tgt_pts1.shape:
+                            continue
+                        m1 = NFIX_AlignmentLogic.solve_alignment(pts1, tgt_pts1)
+                        if m1.to_3x3().determinant() > 0:
+                            homog1 = np.hstack([pts1, np.ones((pts1.shape[0], 1))])
+                            aligned1 = (homog1 @ np.array(m1).T)[:, :3]
+                            if np.sqrt(np.mean(np.sum((aligned1 - tgt_pts1)**2, axis=1))) < shape_match_tol:
+                                M1 = m1
+                                break
 
-            if not matched:
-                self.report({'WARNING'}, f"'{cap['name']}': no suitable non-symmetrical anchor found, skipped.")
-                skipped += 1
+                    if not M1:
+                        continue
 
-        # update scene property
+                    M2 = None
+                    for tgt_pts2 in GOLDEN_TARGETS[match_secondary]:
+                        if pts2.shape != tgt_pts2.shape:
+                            continue
+                        m2 = NFIX_AlignmentLogic.solve_alignment(pts2, tgt_pts2)
+                        if m2.to_3x3().determinant() > 0:
+                            homog2 = np.hstack([pts2, np.ones((pts2.shape[0], 1))])
+                            aligned2 = (homog2 @ np.array(m2).T)[:, :3]
+                            if np.sqrt(np.mean(np.sum((aligned2 - tgt_pts2)**2, axis=1))) < shape_match_tol:
+                                M2 = m2
+                                break
+
+                    if M1 and M2:
+                        diff = np.linalg.norm(np.array(M1) - np.array(M2))
+                        if diff < matrix_tol:
+                            final_matrix = M1
+                            cap['reference_mesh'] = primary_name
+                            cap['validation_mesh'] = secondary_name
+                            break
+                        else:
+                            consensus_failures.append(f"'{primary_name}' vs '{secondary_name}' (diff: {diff:.3f})")
+
+            # 5) Apply or report skip
+            if final_matrix:
+                print(f"SUCCESS: Aligned using '{cap['reference_mesh']}' and '{cap['validation_mesh']}'.")
+                for nm in cap['objects']:
+                    ob = context.scene.objects.get(nm)
+                    if is_ninja(ob):
+                        if "ninjafix_prev_matrix" not in ob:
+                            ob["ninjafix_prev_matrix"] = mat_to_list(ob.matrix_world)
+                        ob.matrix_world = final_matrix @ ob.matrix_world
+                successful_anchors.extend([cap['reference_mesh'], cap['validation_mesh']])
+                for h in geom_cache.values():
+                    SEEN_GEOM_HASHES.add(h)
+                ph = tex_hash_cache[cap['reference_mesh']]
+                if ph:
+                    PREFERRED_ANCHOR_HASHES.add(ph)
+                aligned_count += 1
+            else:
+                print(f"SKIPPED: Could not find a valid, verified anchor pair for '{cap['name']}'.")
+                print("-" * 40)
+                for reason, meshes in sorted(failure_reasons.items()):
+                    if meshes:
+                        if reason == "Secondary: Too Close to Primary":
+                            print(f"- {reason}: {len(meshes)} candidates rejected.")
+                        else:
+                            print(f"- {reason}: {', '.join(sorted(meshes))}")
+                if consensus_failures:
+                    print("- Consensus Failed Between Pairs:")
+                    for info in consensus_failures[:3]:
+                        print(f"    - {info}")
+                    if len(consensus_failures) > 3:
+                        print(f"    - ... and {len(consensus_failures) - 3} others")
+                skipped_count += 1
+
+        # 6) Final selection and write-back
+        if successful_anchors:
+            import bpy
+            bpy.ops.object.select_all(action='DESELECT')
+            for name in set(successful_anchors):
+                obj = context.scene.objects.get(name)
+                if obj:
+                    obj.select_set(True)
+            bpy.context.view_layer.objects.active = context.scene.objects.get(successful_anchors[0])
+
+        import json
         context.scene["ninjafix_capture_sets"] = json.dumps([
-            {'name': c['name'], 'objects': list(c['objects']), 'reference_mesh': c.get('reference_mesh','')}
+            {
+                'name': c['name'],
+                'objects': list(c['objects']),
+                'reference_mesh': c.get('reference_mesh',''),
+                'validation_mesh': c.get('validation_mesh','')
+            }
             for c in CAPTURE_SETS
         ])
 
-        self.report({'INFO'},
-            f"Processing complete: {aligned_count} aligned, {skipped} skipped.")
+        self.report({'INFO'}, f"Processing complete: {aligned_count} aligned, {skipped_count} skipped.")
         return {'FINISHED'}
 
 # =================================================================================================
@@ -970,11 +1568,9 @@ class VIEW3D_PT_NinjaFix_Aligner(Panel):
         layout = self.layout
         st = context.scene.ninjafix_settings
 
-        # Determine fallback for the "ROTATE" icon if not available
         icon_items = bpy.types.UILayout.bl_rna.functions['operator'].parameters['icon'].enum_items.keys()
         rotate_icon = 'ROTATE' if 'ROTATE' in icon_items else 'FILE_TICK'
 
-        # Stage 1: Select Meshes
         if not NUMPY_INSTALLED:
             layout.operator('nfix.install_numpy', icon='ERROR')
             layout.label(text="Restart Blender after installation.")
@@ -988,36 +1584,22 @@ class VIEW3D_PT_NinjaFix_Aligner(Panel):
         if st.target_obj:
             box.label(text=f"Remix: {st.target_obj.name}", icon='MESH_PLANE')
 
-        # Stage 2: Initial Alignment
         box = layout.box()
         box.label(text="Stage 2: Initial Alignment", icon='PLAY')
         box.enabled = bool(st.source_obj and st.target_obj)
-        box.operator(
-            'nfix.calculate_and_batch_fix',
-            text="Generate & Apply Fix",
-            icon=rotate_icon
-        )
+        box.operator('nfix.calculate_and_batch_fix', text="Generate & Apply Fix", icon=rotate_icon)
 
-        # Stage 3: Manage Captures
         box = layout.box()
         box.label(text="Stage 3: Manage Captures", icon='BOOKMARKS')
         box.prop(st, "auto_capture")
-
-        # Import From Folders toggle + UI
         box.prop(st, "import_folders", text="Import From Folders", icon='FILE_FOLDER')
         if st.import_folders:
             box.prop(st, "flip_geometry", text="Flip Geometry")
             box.prop(context.scene, "nfix_parent_dir", text="Parent Folder")
             box.operator("nfix.scan_capture_folders", icon='FILE_FOLDER')
-            box.template_list(
-                "NFIX_UL_FolderList", "",
-                context.scene, "nfix_folder_items",
-                context.scene, "nfix_folder_index",
-                rows=4
-            )
+            box.template_list("NFIX_UL_FolderList", "", context.scene, "nfix_folder_items", context.scene, "nfix_folder_index", rows=4)
             box.operator("nfix.import_selected_folders", icon='IMPORT')
 
-        # Existing capture sets listing
         if not CAPTURE_SETS and "ninjafix_capture_sets" in context.scene:
             try:
                 CAPTURE_SETS[:] = json.loads(context.scene["ninjafix_capture_sets"])
@@ -1037,12 +1619,18 @@ class VIEW3D_PT_NinjaFix_Aligner(Panel):
         else:
             box.operator('nfix.set_current_capture', text="Add New Capture", icon='ADD')
 
-        # Stage 4: Process All & Cleanup
         box = layout.box()
         box.label(text="Stage 4: Process All & Cleanup", icon='FILE_TICK')
         box.operator('nfix.process_all_captures', text="Process All Captures", icon='CHECKMARK')
         box.operator('nfix.undo_last_transform', text="Undo Last Transform", icon='LOOP_BACK')
         box.operator('nfix.remove_mat_duplicates', text="Remove mat_ Duplicates", icon='TRASH')
+
+        # --- DEBUGGING TOOLS ---
+        box = layout.box()
+        col = box.column(align=True)
+        col.label(text="Debugging Tools", icon='GHOST_ENABLED')
+        # A single, powerful report button that works for 1 or 2 selected objects
+        col.operator("nfix.debug_shape_compare", text="Generate Anchor Report")
 
 # =================================================================================================
 # Registration
@@ -1063,6 +1651,7 @@ classes = (
     NFIX_OT_RemoveCapture,
     NFIX_OT_RemoveMatDuplicates,
     NFIX_OT_AutoCaptureTimer,
+    NFIX_OT_DebugShapeCompare, # The only debug tool needed
     VIEW3D_PT_NinjaFix_Aligner,
 )
 
