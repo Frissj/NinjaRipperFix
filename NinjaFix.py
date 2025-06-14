@@ -592,7 +592,7 @@ class NFIX_OT_SelectByTextureHash(Operator):
     texture with any of the currently selected objects.
     """
     bl_idname = "nfix.select_by_texture"
-    bl_label = "Select by Selected Textures"
+    bl_label = "Select Objects by Texture Hash"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
