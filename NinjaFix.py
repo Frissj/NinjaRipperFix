@@ -586,6 +586,67 @@ class NFIX_OT_DebugShapeCompare(Operator):
 
         return {'CANCELLED'}
 
+class NFIX_OT_SelectByTextureHash(Operator):
+    """
+    Selects all objects in the scene that share any Base Color
+    texture with any of the currently selected objects.
+    """
+    bl_idname = "nfix.select_by_texture"
+    bl_label = "Select by Selected Textures"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        # Enable the button if at least one object is selected.
+        return len(context.selected_objects) > 0
+
+    def execute(self, context):
+        # 1. Get the list of initially selected mesh objects
+        source_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        if not source_objects:
+            self.report({'WARNING'}, "No mesh objects are selected.")
+            return {'CANCELLED'}
+
+        # 2. Collect all unique texture hashes from all selected source objects
+        all_target_hashes = set()
+        for obj in source_objects:
+            # Your existing function finds all unique texture hashes on an object
+            hashes = get_individual_texture_hashes(obj)
+            all_target_hashes.update(hashes)
+
+        if not all_target_hashes:
+            self.report({'INFO'}, "Selected objects have no identifiable Base Color textures.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Found {len(all_target_hashes)} unique textures from {len(source_objects)} source objects.")
+
+        # Store the active object to restore it later if it's part of the final selection
+        last_active = context.active_object
+
+        # 3. Deselect all objects in the scene
+        bpy.ops.object.select_all(action='DESELECT')
+
+        # 4. Iterate through all mesh objects in the scene and select matches
+        final_selection = []
+        for obj in context.scene.objects:
+            if obj.type == 'MESH':
+                obj_hashes = get_individual_texture_hashes(obj)
+                # Select if the object's textures have any overlap with the target hashes
+                if not all_target_hashes.isdisjoint(obj_hashes):
+                    obj.select_set(True)
+                    final_selection.append(obj)
+        
+        # 5. Restore the active object if it was part of the new selection
+        if last_active in final_selection:
+            context.view_layer.objects.active = last_active
+        # Otherwise, make the first found object active
+        elif final_selection:
+            context.view_layer.objects.active = final_selection[0]
+
+        self.report({'INFO'}, f"Selected {len(final_selection)} objects sharing common textures.")
+
+        return {'FINISHED'}
+
 class NFIX_OT_RemoveMatDuplicates(Operator):
     bl_idname = "nfix.remove_mat_duplicates"
     bl_label  = "Remove mat_ Duplicates"
@@ -1625,12 +1686,13 @@ class VIEW3D_PT_NinjaFix_Aligner(Panel):
         box.operator('nfix.undo_last_transform', text="Undo Last Transform", icon='LOOP_BACK')
         box.operator('nfix.remove_mat_duplicates', text="Remove mat_ Duplicates", icon='TRASH')
 
-        # --- DEBUGGING TOOLS ---
+        # --- DEBUGGING TOOLS (MODIFIED) ---
         box = layout.box()
-        col = box.column(align=True)
-        col.label(text="Debugging Tools", icon='GHOST_ENABLED')
-        # A single, powerful report button that works for 1 or 2 selected objects
-        col.operator("nfix.debug_shape_compare", text="Generate Anchor Report")
+        # The column(align=True) has been removed from here.
+        # The operators are now drawn directly onto the box for standard spacing.
+        box.label(text="Debugging Tools", icon='GHOST_ENABLED')
+        box.operator("nfix.debug_shape_compare", text="Generate Anchor Report")
+        box.operator("nfix.select_by_texture")
 
 # =================================================================================================
 # Registration
@@ -1651,7 +1713,8 @@ classes = (
     NFIX_OT_RemoveCapture,
     NFIX_OT_RemoveMatDuplicates,
     NFIX_OT_AutoCaptureTimer,
-    NFIX_OT_DebugShapeCompare, # The only debug tool needed
+    NFIX_OT_DebugShapeCompare,
+    NFIX_OT_SelectByTextureHash, # ADD THIS CLASS NAME
     VIEW3D_PT_NinjaFix_Aligner,
 )
 
