@@ -174,6 +174,93 @@ def toggle_auto_capture_timer(self, context):
         bpy.ops.nfix.auto_capture_timer('INVOKE_DEFAULT')
     # If self.auto_capture is False, the running modal operator will detect this on its next tick and terminate itself.
 
+def get_individual_texture_hashes(obj):
+    """
+    Finds all unique Base Color textures on an object and returns their SHA256 hashes.
+    It works by finding the Principled BSDF node in each material, tracing the
+    'Base Color' input to an Image Texture node, and then calculating a hash
+    from the raw pixel data of that image. Hashes are cached to prevent
+    re-calculating for the same texture.
+
+    Args:
+        obj (bpy.types.Object): The object to inspect.
+
+    Returns:
+        set: A set of unique SHA256 hash strings for each found Base Color texture.
+             Returns an empty set if no valid textures are found.
+    """
+    global _TEXTURE_HASH_CACHE # Use the global cache for efficiency
+
+    if not obj or obj.type != 'MESH' or not obj.data.materials:
+        return set()
+
+    found_hashes = set()
+
+    for mat_slot in obj.material_slots:
+        if not mat_slot.material or not mat_slot.material.use_nodes:
+            continue
+
+        material = mat_slot.material
+        
+        # Find the Principled BSDF node
+        principled_node = None
+        for node in material.node_tree.nodes:
+            if node.type == 'BSDF_PRINCIPLED':
+                principled_node = node
+                break
+        
+        if not principled_node:
+            continue
+
+        # Get the 'Base Color' input socket
+        base_color_input = principled_node.inputs.get('Base Color')
+        if not base_color_input or not base_color_input.is_linked:
+            continue
+            
+        # Trace the link to the source node
+        link = base_color_input.links[0]
+        source_node = link.from_node
+
+        # Check if the source is an Image Texture node with a valid image
+        if source_node.type == 'TEX_IMAGE' and source_node.image:
+            image = source_node.image
+
+            # If hash is already cached, use it
+            if image.name in _TEXTURE_HASH_CACHE:
+                img_hash = _TEXTURE_HASH_CACHE[image.name]
+                if img_hash: # Only add if it's not a known failure (None)
+                    found_hashes.add(img_hash)
+                continue
+
+            # If the image has pixel data, calculate its hash
+            if image.has_data:
+                try:
+                    # Ensure pixels are loaded. This can be slow the first time.
+                    if image.packed_file:
+                        image.unpack()
+
+                    # Use numpy for fast pixel access
+                    size = image.size[0] * image.size[1] * image.channels
+                    if size == 0: continue # Skip empty images
+                    
+                    pixels = np.empty(size, dtype=np.float32)
+                    image.pixels.foreach_get(pixels)
+                    
+                    # Calculate hash from the raw pixel data bytes
+                    hasher = hashlib.sha256()
+                    hasher.update(pixels.tobytes())
+                    img_hash = hasher.hexdigest()
+
+                    # Cache and add the new hash
+                    _TEXTURE_HASH_CACHE[image.name] = img_hash
+                    found_hashes.add(img_hash)
+                except Exception as e:
+                    # This might happen if the image is invalid or cannot be accessed
+                    print(f"Warning: Could not hash texture '{image.name}' for object '{obj.name}'. Reason: {e}")
+                    _TEXTURE_HASH_CACHE[image.name] = None # Cache failure to avoid retrying
+
+    return found_hashes
+
 # =================================================================================================
 # Core Alignment and Data Logic (NEW AND UNIFIED)
 # =================================================================================================
