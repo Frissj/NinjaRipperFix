@@ -33,6 +33,7 @@ NON_UNIQUE_GEOM_HASHES = set()
 SEEN_GEOM_HASHES = set()
 TEXTURE_PIXEL_CACHE = {}
 _TEXTURE_HASH_CACHE = {}
+_VC_HASH_CACHE = {} # <-- ADD THIS LINE
 
 # --- Dependency Check ---
 try:
@@ -73,6 +74,50 @@ def get_db_path():
     if not blend_path:
         return None
     return os.path.join(os.path.dirname(blend_path), ".ninjafix_db.json")
+
+def get_vertex_color_hash(obj):
+    """
+    Calculates a SHA256 hash from an object's active vertex color layer.
+    The hash is based on a sorted array of the color data, making it
+    independent of loop order. Caches the result for efficiency.
+
+    Args:
+        obj (bpy.types.Object): The object to inspect.
+
+    Returns:
+        str or None: The hash string if a valid vertex color layer exists, otherwise None.
+    """
+    global _VC_HASH_CACHE
+    if obj.name in _VC_HASH_CACHE:
+        return _VC_HASH_CACHE[obj.name]
+
+    if not obj or obj.type != 'MESH' or not obj.data.vertex_colors.active:
+        _VC_HASH_CACHE[obj.name] = None
+        return None
+
+    vc_layer = obj.data.vertex_colors.active
+    num_loops = len(obj.data.loops)
+    
+    if num_loops == 0:
+        _VC_HASH_CACHE[obj.name] = None
+        return None
+
+    # Get colors as a flat numpy array (R,G,B,A, R,G,B,A, ...)
+    colors = np.empty(num_loops * 4, dtype=np.float32)
+    vc_layer.data.foreach_get('color', colors)
+
+    # To create a canonical hash, reshape to (N,4), sort the rows lexicographically,
+    # and then hash the bytes of the sorted array. This makes the hash
+    # independent of the mesh's internal loop order.
+    colors.shape = (num_loops, 4)
+    sorted_colors = colors[np.lexsort(colors.T[::-1])]
+
+    hasher = hashlib.sha256()
+    hasher.update(sorted_colors.tobytes())
+    vc_hash = hasher.hexdigest()
+
+    _VC_HASH_CACHE[obj.name] = vc_hash
+    return vc_hash
 
 def get_geometry_hash(obj):
     """
@@ -501,65 +546,107 @@ class NFIX_OT_DebugShapeCompare(Operator):
 
         return {'CANCELLED'}
 
-class NFIX_OT_SelectByTextureHash(Operator):
+class NFIX_OT_SelectByAppearance(Operator):
     """
-    Selects all objects in the scene that share any Base Color
-    texture with any of the currently selected objects.
+    Selects all objects that share appearance properties (simple Base Color, 
+    Base Color texture, or active Vertex Colors) with the selected objects.
     """
-    bl_idname = "nfix.select_by_texture"
-    bl_label = "Select Objects by Texture Hash"
+    bl_idname = "nfix.select_by_appearance"
+    bl_label = "Select by Appearance (Color/Texture/VCol)"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        # Enable the button if at least one object is selected.
         return len(context.selected_objects) > 0
 
+    def get_simple_base_color(self, obj):
+        """
+        If a material's Base Color is not connected to any node,
+        return that simple RGBA color. Returns a tuple of floats.
+        """
+        if not obj.active_material or not obj.active_material.use_nodes:
+            return None
+        
+        try:
+            nodes = obj.active_material.node_tree.nodes
+            principled = next(n for n in nodes if n.type == 'BSDF_PRINCIPLED')
+            
+            base_color_input = principled.inputs.get('Base Color')
+            if not base_color_input.is_linked:
+                # Return color as a tuple to make it hashable for the set
+                return tuple(base_color_input.default_value)
+        except StopIteration: # No Principled BSDF found
+            return None
+        return None
+
     def execute(self, context):
-        # 1. Get the list of initially selected mesh objects
         source_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
         if not source_objects:
             self.report({'WARNING'}, "No mesh objects are selected.")
             return {'CANCELLED'}
 
-        # 2. Collect all unique texture hashes from all selected source objects
-        all_target_hashes = set()
+        # --- NOW TRACKS THREE TYPES OF APPEARANCE ---
+        all_target_colors = set()
+        all_target_texture_hashes = set()
+        all_target_vc_hashes = set()
+        
         for obj in source_objects:
-            # Your existing function finds all unique texture hashes on an object
-            hashes = get_individual_texture_hashes(obj)
-            all_target_hashes.update(hashes)
+            # Method 1: Check for a simple, solid Base Color
+            simple_color = self.get_simple_base_color(obj)
+            if simple_color:
+                all_target_colors.add(simple_color)
+            
+            # Method 2: Check for texture hashes
+            texture_hashes = get_individual_texture_hashes(obj)
+            all_target_texture_hashes.update(texture_hashes)
+            
+            # Method 3: Check for vertex color hash
+            vc_hash = get_vertex_color_hash(obj)
+            if vc_hash:
+                all_target_vc_hashes.add(vc_hash)
 
-        if not all_target_hashes:
-            self.report({'INFO'}, "Selected objects have no identifiable Base Color textures.")
+        if not all_target_colors and not all_target_texture_hashes and not all_target_vc_hashes:
+            self.report({'INFO'}, "Selected objects have no identifiable appearance to match.")
             return {'CANCELLED'}
 
-        self.report({'INFO'}, f"Found {len(all_target_hashes)} unique textures from {len(source_objects)} source objects.")
-
-        # Store the active object to restore it later if it's part of the final selection
+        # Store the active object to restore it later
         last_active = context.active_object
 
-        # 3. Deselect all objects in the scene
+        # Deselect all objects in the scene
         bpy.ops.object.select_all(action='DESELECT')
 
-        # 4. Iterate through all mesh objects in the scene and select matches
+        # Iterate through all mesh objects in the scene and select matches
         final_selection = []
         for obj in context.scene.objects:
             if obj.type == 'MESH':
-                obj_hashes = get_individual_texture_hashes(obj)
-                # Select if the object's textures have any overlap with the target hashes
-                if not all_target_hashes.isdisjoint(obj_hashes):
+                should_select = False
+                
+                # Check for any of the three matching conditions
+                if all_target_colors:
+                    obj_color = self.get_simple_base_color(obj)
+                    if obj_color and obj_color in all_target_colors:
+                        should_select = True
+
+                if not should_select and all_target_texture_hashes:
+                    obj_texture_hashes = get_individual_texture_hashes(obj)
+                    if not all_target_texture_hashes.isdisjoint(obj_texture_hashes):
+                        should_select = True
+                
+                if not should_select and all_target_vc_hashes:
+                    obj_vc_hash = get_vertex_color_hash(obj)
+                    if obj_vc_hash and obj_vc_hash in all_target_vc_hashes:
+                        should_select = True
+
+                if should_select:
                     obj.select_set(True)
                     final_selection.append(obj)
         
-        # 5. Restore the active object if it was part of the new selection
         if last_active in final_selection:
             context.view_layer.objects.active = last_active
-        # Otherwise, make the first found object active
         elif final_selection:
             context.view_layer.objects.active = final_selection[0]
 
-        self.report({'INFO'}, f"Selected {len(final_selection)} objects sharing common textures.")
-
+        self.report({'INFO'}, f"Selected {len(final_selection)} objects with shared appearance.")
         return {'FINISHED'}
 
 class NFIX_OT_RemoveMatDuplicates(Operator):
@@ -1461,7 +1548,7 @@ class VIEW3D_PT_NinjaFix_Aligner(Panel):
         # The operators are now drawn directly onto the box for standard spacing.
         box.label(text="Debugging Tools", icon='GHOST_ENABLED')
         box.operator("nfix.debug_shape_compare", text="Generate Anchor Report")
-        box.operator("nfix.select_by_texture")
+        box.operator("nfix.select_by_appearance")
 
 # =================================================================================================
 # Registration
@@ -1483,7 +1570,7 @@ classes = (
     NFIX_OT_RemoveMatDuplicates,
     NFIX_OT_AutoCaptureTimer,
     NFIX_OT_DebugShapeCompare,
-    NFIX_OT_SelectByTextureHash, # ADD THIS CLASS NAME
+    NFIX_OT_SelectByAppearance,# ADD THIS CLASS NAME
     VIEW3D_PT_NinjaFix_Aligner,
 )
 
